@@ -1,6 +1,6 @@
 /*
- * The clock speed of the processor cores the kernel runs on, on the POCO X5 Pro (redwood).
- * Only with boot-arg cpufreq=1: the addresses are this phone's.
+ * CPU frequency control for redwood (EPSS) and raphael (OSM), with cpufreq=1.
+ * The SM8150 path reads its firmware LUT and uses active/idle levels with touch boost.
  *
  * The boot loader leaves each group of cores at a modest frequency and expects the operating
  * system to ask for more. On this SoC that is one register write: the hardware ("EPSS") has
@@ -13,6 +13,7 @@
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <kern/simple_lock.h>
 #include <os/atomic_private.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -84,6 +85,183 @@ domain_of(uint32_t phys_id)
 	uint32_t core = (phys_id >> 8) & 0xff;
 
 	return core < 4 ? 0 : core < 7 ? 1 : 2;
+}
+
+/* SM8150 uses OSM, not EPSS: addresses and 32-byte LUT rows from its Linux DT/driver. */
+static const uint32_t osm_phys[3] = { 0x18323000, 0x18325800, 0x18327800 };
+static vm_offset_t osm_base[3];
+static uint32_t osm_saved[3], osm_low[3], osm_high[3], osm_row[3], osm_khz[3][40];
+static bool osm_stopping;
+static simple_lock_data_t osm_lock;
+static uint64_t osm_boost_until;
+
+void
+hakios_cpufreq_boost(void)
+{
+	uint64_t deadline;
+
+	if ((osm_base[0] | osm_base[1] | osm_base[2]) == 0 || os_atomic_load(&osm_stopping, acquire)) {
+		return;
+	}
+	clock_interval_to_deadline(200, NSEC_PER_MSEC, &deadline);
+	simple_lock(&osm_lock, LCK_GRP_NULL);
+	osm_boost_until = deadline;
+	for (unsigned d = 0; d < 3; d++) {
+		if (osm_base[d] != 0) {
+			*(volatile uint32_t *)(osm_base[d] + 0x920) = osm_high[d];
+			osm_row[d] = osm_high[d];
+		}
+	}
+	simple_unlock(&osm_lock);
+}
+
+static bool
+osm_lut(const uint32_t *entries, uint32_t *khz, uint32_t *low, uint32_t *high)
+{
+	uint32_t previous = ~0u;
+	bool found = false;
+
+	for (uint32_t i = 0; i < 40; i++) {
+		uint32_t word = entries[i], cores = word >> 16 & 7;
+		uint32_t freq = word >> 30 ? XO_KHZ * (word & 0xff) : ALTERNATE_KHZ;
+
+		if (i && (word & 0xc00700ffu) == previous) {
+			break;
+		}
+		previous = word & 0xc00700ffu;
+		khz[i] = freq;
+		/* qcom,freq-domain's max_cores is 4; the other rows are single-core boost. */
+		if (cores != 4 || freq < 300000 || freq > 4000000) {
+			continue;
+		}
+		if (!found || freq < khz[*low]) {
+			*low = i;
+		}
+		if (!found || freq > khz[*high]) {
+			*high = i;
+		}
+		found = true;
+	}
+	return found;
+}
+
+static void
+osm_governor(void *arg __unused, wait_result_t wr __unused)
+{
+	const ml_topology_info_t *topology = ml_get_topology_info();
+	uint64_t idle_before[MAX_CPUS] = { 0 }, then = mach_absolute_time();
+	unsigned quiet[3] = { 0 }, samples = 0;
+
+	for (unsigned i = 0; i < topology->num_cpus; i++) {
+		ml_cpu_idle_time((int)i, &idle_before[i]);
+	}
+	while (!os_atomic_load(&osm_stopping, acquire)) {
+		uint32_t busy[3] = { 0 };
+		uint64_t now;
+
+		delay_for_interval(50, NSEC_PER_MSEC);
+		if (os_atomic_load(&osm_stopping, acquire)) {
+			break;
+		}
+		now = mach_absolute_time();
+		for (unsigned i = 0; i < topology->num_cpus; i++) {
+			uint64_t idle = 0, elapsed = now - then, delta;
+			uint32_t domain = domain_of(topology->cpus[i].phys_id), load;
+
+			if (!ml_cpu_idle_time((int)i, &idle) || elapsed == 0) {
+				continue;
+			}
+			delta = idle - idle_before[i];
+			idle_before[i] = idle;
+			load = delta < elapsed ? (uint32_t)((elapsed - delta) * 100 / elapsed) : 0;
+			busy[domain] = MAX(busy[domain], load);
+		}
+		then = now;
+		simple_lock(&osm_lock, LCK_GRP_NULL);
+		for (unsigned d = 0; d < 3; d++) {
+			uint32_t wanted;
+
+			if (osm_base[d] == 0) {
+				continue;
+			}
+			quiet[d] = busy[d] < 20 ? quiet[d] + 1 : 0;
+			/* shortcut: active/idle OSM levels; refine only after measuring power and latency. */
+			wanted = samples < 40 || now < osm_boost_until || quiet[d] < 4 ? osm_high[d] : osm_low[d];
+			if (wanted != osm_row[d]) {
+				*(volatile uint32_t *)(osm_base[d] + 0x920) = wanted;
+				__asm__ volatile ("dsb sy" ::: "memory");
+				osm_row[d] = wanted;
+			}
+		}
+		simple_unlock(&osm_lock);
+		if (samples % 100 == 0) {
+			for (unsigned d = 0; d < 3; d++) {
+				if (osm_base[d] != 0) {
+					uint32_t row = *(volatile uint32_t *)(osm_base[d] + 0x920);
+					tell("cpufreq: OSM group %u load %u%% row %u (%u MHz)\n", d, busy[d], row,
+					    row < 40 ? osm_khz[d][row] / 1000 : 0);
+				}
+			}
+		}
+		samples++;
+	}
+}
+
+static void
+osm_start(void)
+{
+	thread_t thread;
+	uint32_t mode = 1;
+	const ml_topology_info_t *topology = ml_get_topology_info();
+	static const unsigned domain_cpus[3] = { 4, 3, 1 };
+	unsigned owned[3] = { 0 };
+
+	PE_parse_boot_argn("cpufreq", &mode, sizeof(mode));
+	simple_lock_init(&osm_lock, 0);
+	for (unsigned i = 0; i < topology->num_cpus; i++) {
+		owned[domain_of(topology->cpus[i].phys_id)]++;
+	}
+	for (unsigned d = 0; d < 3; d++) {
+		uint32_t words[40];
+		if (owned[d] == 0 && mode != 2) {
+			continue;
+		}
+		vm_offset_t base = ml_io_map(osm_phys[d], 0x1400);
+
+		if (base == 0 || !(*(volatile uint32_t *)base & 1)) {
+			tell("cpufreq: OSM group %u is not enabled by firmware\n", d);
+			continue;
+		}
+		for (unsigned i = 0; i < 40; i++) {
+			words[i] = *(volatile uint32_t *)(base + 0x110 + 32 * i);
+		}
+		if (!osm_lut(words, osm_khz[d], &osm_low[d], &osm_high[d])) {
+			tell("cpufreq: OSM group %u has no valid frequency table\n", d);
+			continue;
+		}
+		/* A firmware-owned core's load (notably the USB loader) is absent from XNU's counters. */
+		if (mode == 2 || owned[d] != domain_cpus[d]) {
+			osm_low[d] = osm_high[d];
+		}
+		osm_base[d] = base;
+		osm_saved[d] = *(volatile uint32_t *)(base + 0x920);
+		osm_row[d] = osm_high[d];
+		*(volatile uint32_t *)(base + 0x920) = osm_row[d];
+		tell("cpufreq: OSM group %u at %#x, firmware row %u -> %u, %u..%u MHz\n", d, osm_phys[d], osm_saved[d],
+		    osm_row[d], osm_khz[d][osm_low[d]] / 1000, osm_khz[d][osm_high[d]] / 1000);
+	}
+	if (mode == 2) tell("cpufreq: cpufreq=2: %s at highest non-boost LUT rows\n",
+	    osm_base[0] && osm_base[1] && osm_base[2] ? "all OSM domains locked" : "incomplete domain coverage");
+	if (kernel_thread_start(osm_governor, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "SM8150 OSM governor");
+		thread_deallocate(thread);
+	} else {
+		os_atomic_store(&osm_stopping, true, release);
+		for (unsigned d = 0; d < 3; d++) {
+			if (osm_base[d]) *(volatile uint32_t *)(osm_base[d] + 0x920) = osm_saved[d];
+		}
+		tell("cpufreq: OSM governor could not start, firmware frequencies restored\n");
+	}
 }
 
 static void
@@ -543,6 +721,13 @@ hakios_ddr_quiesce(void)
 	uint32_t rest = DDR_REST, data[2];
 	bool done;
 
+	os_atomic_store(&osm_stopping, true, release);
+	for (unsigned d = 0; d < 3; d++) {
+		if (osm_base[d] != 0) {
+			*(volatile uint32_t *)(osm_base[d] + 0x920) = osm_saved[d];
+		}
+	}
+
 	if (!ddr_voted) {
 		return;
 	}
@@ -561,6 +746,12 @@ hakios_cpufreq_init(void)
 	uint32_t enabled = 0, cores[EPSS_DOMAINS] = { 0 }, before, here;
 
 	load_start();
+	if (hakios_is_raphael()) {
+		if (cpufreq_wanted()) {
+			osm_start();
+		}
+		return; /* The redwood DDR vote below also uses a different SoC's registers. */
+	}
 	enabled = 2;
 	PE_parse_boot_argn("ddr", &enabled, sizeof(enabled));
 	if (enabled == 1) {
