@@ -387,7 +387,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# fairplayd among them).
 	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
 	VOLUME=""
-	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
+	[ -n "$FLASHBOOT" ] && [ "$FLASHBOOT" != prepared ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
@@ -502,7 +502,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	# with CRYPTEXES=flash the cryptexes are read from the phone's flash and this tree is
 	# built and thrown away unused. The guard ends with the cache: everything after it goes
 	# into the boot volume, which every recipe carries, flash cryptexes included
-	if [ "$CRYPTEXES" != flash ]; then
+	if [ "$CRYPTEXES" != flash ] && [ "$FLASHBOOT" != prepared ]; then
 		if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot.os; else mkdir -p flashboot.os; fi
 		D=flashboot.os/System/Library/Caches/com.apple.dyld
 		mkdir -p $D
@@ -541,7 +541,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	# the third container: Apple's App cryptex as it is (10 MB; fetch.sh), for the boot volume's Cryptexes/App
 	APP=""
 	[ -f $IOS/cryptex-app.dmg ] && APP=$IOS/cryptex-app.dmg
-	if [ "$CRYPTEXES" = flash ]; then
+	if [ "$CRYPTEXES" = flash ] || [ "$FLASHBOOT" = prepared ]; then
 		mv flashboot.boot.apfs flashboot.apfs
 	elif [ -n "$CRYPTEX_IMAGE" ]; then
 		cat flashboot.boot.apfs "$CRYPTEX_IMAGE" $APP > flashboot.apfs

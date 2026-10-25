@@ -1490,6 +1490,11 @@ ufs_survey(void)
 #define BLOCK_DARWIN_LAST  30617594ULL
 #define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
 #define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
+/* This test phone only: verified against both GPTs before preparing the userdata deployment. */
+#define BLOCK_RAPHAEL_FIRST 507904ULL
+#define BLOCK_RAPHAEL_LAST  29644794ULL
+#define BLOCK_RAPHAEL_TYPE { 0x1b81e7e6, 0xf50d, 0x419b, { 0xa7, 0x39, 0x2a, 0xee, 0xf8, 0xda, 0x33, 0x35 } }
+#define BLOCK_RAPHAEL_UNIQ { 0x108aa3c4, 0x7ab6, 0xc5c5, { 0xb1, 0x1f, 0x20, 0x2e, 0x65, 0x8e, 0xf1, 0x37 } }
 
 /*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
@@ -1827,37 +1832,43 @@ block_tables(void)
  * is already in bp->name (ufs_name), in ASCII.
  */
 static int
-block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
+block_is_store(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
 {
-	static const efi_guid type = BLOCK_DARWIN_TYPE, uniq = BLOCK_DARWIN_UNIQ;
-	static const char name[] = "darwin";
+	static const efi_guid darwin_type = BLOCK_DARWIN_TYPE, darwin_uniq = BLOCK_DARWIN_UNIQ;
+	static const efi_guid raphael_type = BLOCK_RAPHAEL_TYPE, raphael_uniq = BLOCK_RAPHAEL_UNIQ;
+	int raphael = PLAT == &platform_raphael;
+	const efi_guid *type = raphael ? &raphael_type : &darwin_type;
+	const efi_guid *uniq = raphael ? &raphael_uniq : &darwin_uniq;
+	const char *name = raphael ? "userdata" : "darwin";
+	uint64_t first = raphael ? BLOCK_RAPHAEL_FIRST : BLOCK_DARWIN_FIRST;
+	uint64_t last = raphael ? BLOCK_RAPHAEL_LAST : BLOCK_DARWIN_LAST;
 	const char *why = NULL;
 
-	for (unsigned i = 0; i < sizeof(name); i++) {
+	for (unsigned i = 0; i <= str_len(name); i++) {
 		if (bp->name[i] != name[i]) {
 			return 0;               /* another partition: nothing to say about it */
 		}
 	}
-	if (memcmp(&info->type_guid, &type, sizeof(type)) != 0) {
+	if (memcmp(&info->type_guid, type, sizeof(*type)) != 0) {
 		why = "its type GUID is not the one it had";
-	} else if (memcmp(&info->unique_guid, &uniq, sizeof(uniq)) != 0) {
+	} else if (memcmp(&info->unique_guid, uniq, sizeof(*uniq)) != 0) {
 		why = "its unique GUID is not the one it had";
-	} else if (info->start_lba != BLOCK_DARWIN_FIRST || info->end_lba != BLOCK_DARWIN_LAST) {
+	} else if (info->start_lba != first || info->end_lba != last) {
 		why = "it does not begin and end where it did";
 	} else if (bp->unit != 0) {
 		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
 		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
 		why = "it is not on the first logical unit";
-	} else if (bp->block_size != 4096 || bp->blocks != BLOCK_DARWIN_LAST - BLOCK_DARWIN_FIRST + 1) {
+	} else if (bp->block_size != 4096 || bp->blocks != last - first + 1) {
 		why = "its blocks are not what they were";
 	} else if (bio->media->read_only) {
 		why = "UEFI gives it out read only";
 	}
 	if (why != NULL) {
-		print("ufs: darwin: no write will be served: %s\n", why);
+		print("ufs: %s: no write will be served: %s\n", name, why);
 		return 0;
 	}
-	print("ufs: darwin (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n",
+	print("ufs: %s (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n", name,
 	    info->start_lba, info->end_lba, BLOCK_WRITE_FIRST);
 	return 1;
 }
@@ -1932,7 +1943,7 @@ block_start(void)
 				}
 			}
 		}
-		if (block_write_requested && block_is_darwin(info, bio, bp)) {
+		if (block_write_requested && block_is_store(info, bio, bp)) {
 			block_write_part = (int)block_shared.parts;
 		}
 		block_bios[block_shared.parts++] = bio;
@@ -3343,7 +3354,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (uint64_t)block_shared.kernel_native.switched_in, (uint64_t)block_shared.kernel_native.switched_out);
 	}
 	if (block_write_requested) {
-		print("ufs: %d writes into darwin, %d bytes, read back the same; %d refused\n", block_writes,
+		print("ufs: %d writes into the data partition, %d bytes, read back the same; %d refused\n", block_writes,
 		    block_write_bytes, block_writes_refused);
 	}
 	/* ... and its other cores should all be off again: the next kernel cannot start one that is not */
@@ -3594,6 +3605,59 @@ starts_with(const char *s, const char *prefix)
 	return 1;
 }
 
+/* Idle-only block reads for firmware extraction and deployment readback; never writes storage. */
+static void
+fb_read_part(char *args)
+{
+	char *fields[3] = { args, NULL, NULL };
+	unsigned n = 1;
+	staged_data = NULL;
+	staged_len = 0;
+	for (char *c = args; *c; c++) {
+		if (*c == ' ') {
+			if (n == 3) { fb_reply("FAIL", "expected name lba count (hex blocks)"); return; }
+			*c = 0;
+			fields[n++] = c + 1;
+		}
+	}
+	if (n != 3 || !fields[0][0] || str_len(fields[0]) >= 36) {
+		fb_reply("FAIL", "expected name lba count (hex blocks)"); return;
+	}
+	for (unsigned i = 1; i < 3; i++) {
+		if (!fields[i][0] || str_len(fields[i]) > 16) {
+			fb_reply("FAIL", "invalid block range"); return;
+		}
+		for (const char *c = fields[i]; *c; c++) {
+			if (!((*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'f'))) {
+				fb_reply("FAIL", "invalid block range"); return;
+			}
+		}
+	}
+	uint64_t lba = parse_number(fields[1], 16), count = parse_number(fields[2], 16);
+	if (block_shared.magic != BLOCK_MAGIC) block_start();
+	uint32_t found = BLOCK_MAX_PARTS;
+	for (uint32_t i = 0; i < block_shared.parts; i++) {
+		if (str_eq(fields[0], block_shared.part[i].name)) {
+			if (found != BLOCK_MAX_PARTS) { fb_reply("FAIL", "ambiguous partition name"); return; }
+			found = i;
+		}
+	}
+	if (found == BLOCK_MAX_PARTS) { fb_reply("FAIL", "no such partition"); return; }
+	const struct loader_block_part *p = &block_shared.part[found];
+	if (!hc_list_is_uefis() || p->block_size == 0 || count == 0 ||
+	    count > BLOCK_BUFFER_SIZE / p->block_size || lba >= p->blocks || count > p->blocks - lba) {
+		fb_reply("FAIL", "read outside partition/buffer or controller busy"); return;
+	}
+	uint64_t bytes = count * p->block_size;
+	efi_block_io *bio = block_bios[found];
+	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer))) {
+		fb_reply("FAIL", "ReadBlocks failed"); return;
+	}
+	staged_data = (const char *)block_buffer;
+	staged_len = bytes;
+	fb_reply("OKAY", "");
+}
+
 /*
  * One command from the host. While a kernel runs on another core (running_live) only what does
  * not disturb it: questions, the screen, the log so far, and "oem stop".
@@ -3606,7 +3670,8 @@ fb_command(char *cmd)
 	{
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
-		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
+		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap") ||
+		    starts_with(cmd, "oem read-part"))) {
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
@@ -3696,6 +3761,8 @@ fb_command(char *cmd)
 				sent += chunk;
 			}
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem read-part ")) {
+			fb_read_part(cmd + 14);
 		} else if (starts_with(cmd, "oem screenshot")) {
 			/* stage the raw framebuffer; "getvar screen" gives its geometry */
 			if (SCREEN.base == 0) {

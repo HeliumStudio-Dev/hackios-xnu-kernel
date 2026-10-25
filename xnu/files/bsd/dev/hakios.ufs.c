@@ -428,7 +428,7 @@ hakios_ufs_report(const char *when)
 	    "copying %llu ms\n", when, ufs_requests, ufs_small, ufs_medium, ufs_large, ufs_sequential,
 	    ufs_errors, ufs_bytes, ufs_wait_us / 1000, loader_ns / 1000000, ufs_copy_us / 1000);
 	if (ufs_write_part >= 0 || ufs_writes != 0 || ufs_write_refused != 0) {
-		printf("ufs: %s: %llu writes into darwin, %llu bytes, read back by the loader; %llu did not "
+		printf("ufs: %s: %llu writes into the data partition, %llu bytes, read back by the loader; %llu did not "
 		    "finish, %llu refused here\n", when, ufs_writes, ufs_write_bytes, ufs_write_errors,
 		    ufs_write_refused);
 	}
@@ -598,7 +598,7 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 		ufs_write_out = true;
 		if (ufs_write_was_native) {
 			ufs_native_on = false;
-			ufs_native_out("writing the data volume into darwin");
+			ufs_native_out("writing the data volume into the data partition");
 		}
 	}
 	while (len > 0 && error == 0) {
@@ -1534,15 +1534,20 @@ hakios_ufs_init(void)
 	check = 0;
 	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
 		uint32_t offered = ufs_page->write_part_plus_one;
+		bool raphael = hakios_is_raphael();
+		const char *store_name = raphael ? "userdata" : "darwin";
+		uint64_t store_first = raphael ? 507904ULL : UFS_DARWIN_FIRST;
+		uint64_t store_blocks = raphael ? 29136891ULL : UFS_DARWIN_BLOCKS;
 
 		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != UFS_WRITE_FIRST) {
 			printf("ufs: the loader offers no partition to write into (ufs_write=1 on its command "
 			    "line too, and a loader that knows about writes)\n");
+			offered = 0;
 		}
 		for (uint32_t i = 0; offered != 0 && i < ufs_parts; i++) {
 			const char *why = NULL;
 
-			if (strncmp((const char *)ufs_page->part[i].name, "darwin", 7) != 0) {
+			if (strcmp((const char *)ufs_page->part[i].name, store_name) != 0) {
 				continue;
 			}
 			if (i != offered - 1) {
@@ -1554,25 +1559,25 @@ hakios_ufs_init(void)
 				 * has compared with the loader's reads; the device path this firmware gives
 				 * says no logical unit number at all, so part[].lun is 0xff for every unit */
 				why = "it is not on the first logical unit";
-			} else if (ufs_page->part[i].start_lba != UFS_DARWIN_FIRST) {
+			} else if (ufs_page->part[i].start_lba != store_first) {
 				why = "it does not begin where it did";
-			} else if (ufs_page->part[i].blocks != UFS_DARWIN_BLOCKS) {
+			} else if (ufs_page->part[i].blocks != store_blocks) {
 				why = "it is not the size it was";
 			} else if (ufs_page->part[i].block_size != 4096) {
 				why = "its blocks are not 4096 bytes";
 			}
 			if (why != NULL) {
-				printf("ufs: darwin: no write will be asked for: %s\n", why);
+				printf("ufs: %s: no write will be asked for: %s\n", store_name, why);
 				continue;
 			}
 			ufs_write_part = (int)i;
 		}
 		if (ufs_write_part >= 0) {
-			printf("ufs: /dev/rufs_darwin takes writes, whole blocks from %llu on (%llu MB of it); "
-			    "everything else of the storage is read only\n", UFS_WRITE_FIRST,
-			    (UFS_DARWIN_BLOCKS - UFS_WRITE_FIRST) * 4096 >> 20);
+			printf("ufs: /dev/rufs_%s takes writes, whole blocks from %llu on (%llu MB of it); "
+			    "everything else of the storage is read only\n", store_name, UFS_WRITE_FIRST,
+			    (store_blocks - UFS_WRITE_FIRST) * 4096 >> 20);
 		} else {
-			printf("ufs: nothing takes writes: darwin is not among the partitions\n");
+			printf("ufs: nothing takes writes: %s has not passed identity checks\n", store_name);
 		}
 	}
 

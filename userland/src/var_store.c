@@ -51,7 +51,7 @@
 #define STORE_AT        8589934592LL            /* darwin's block 2097152: past the cryptexes, with room to spare */
 #define SLOT_BYTES      0x80000000LL            /* 2 GiB a slot, two slots */
 #define SLOTS           2
-#define DEVICE          "/dev/rufs_darwin"
+static const char *store_device = "/dev/rufs_darwin";
 #define ROOT            "/private/var"
 #define MAX_PATH        1024
 #define MAX_DEPTH       32
@@ -1249,9 +1249,9 @@ save_once(void)
 	 * device is closed (bsd/dev/hakios.ufs.c, ufs_cclose). A watcher that kept the device open
 	 * would leave iOS reading the flash through the loader for the rest of the run.
 	 */
-	fd = open(DEVICE, O_RDWR, 0);
+	fd = open(store_device, O_RDWR, 0);
 	if (fd < 0) {
-		printf("var_store: %s: %s\n", DEVICE, strerror(errno));
+		printf("var_store: %s: %s\n", store_device, strerror(errno));
 		return 0;
 	}
 	ok = claim() && save();
@@ -1267,9 +1267,9 @@ watch(int seconds)
 	uint64_t last = 0;
 	int asked = 0;
 
-	fd = open(DEVICE, O_RDWR, 0);
+	fd = open(store_device, O_RDWR, 0);
 	if (fd < 0) {
-		printf("var_store: %s cannot be written (%s): nothing would be saved\n", DEVICE,
+		printf("var_store: %s cannot be written (%s): nothing would be saved\n", store_device,
 		    strerror(errno));
 		return 0;
 	}
@@ -1362,6 +1362,7 @@ main(int argc, char **argv, char **envp)
 
 	(void)envp;
 	crc_init();
+	if (boot_arg_is("root_apfs", "ufs_userdata")) store_device = "/dev/rufs_userdata";
 	if (strcmp(what, "stamp") == 0) {
 		return stamp(argc > 2 ? argv[2] : "/private/var/hakios-stamp") ? 0 : 1;
 	}
@@ -1383,9 +1384,9 @@ main(int argc, char **argv, char **envp)
 		}
 		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;
 	}
-	fd = open(DEVICE, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY : O_RDWR, 0);
+	fd = open(store_device, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY : O_RDWR, 0);
 	if (fd < 0) {
-		printf("var_store: %s: %s (the kernel takes writes with ufs_write=1)\n", DEVICE,
+		printf("var_store: %s: %s (the kernel takes writes with ufs_write=1)\n", store_device,
 		    strerror(errno));
 		return 1;
 	}

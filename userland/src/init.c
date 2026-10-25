@@ -191,6 +191,18 @@ flash_root(const char *dev)
 	if (!ok) {
 		return;
 	}
+	/* Raphael's existing system volume is already prepared; keep it read-only and reuse its links. */
+	int prepared = stat("/flash/sbin/launchd.ios", &fw_st) == 0 && (fw_st.st_mode & S_IFMT) == S_IFREG;
+	if (prepared) {
+		if (stat("/flash/private/preboot", &fw_st) != 0 && !synthetic_dir("/flash/private/preboot")) return;
+		ok = sysctlbyname("kern.hakios_switch_root", NULL, NULL, "/flash private/preboot", 22) == 0;
+		check(ok, "the prepared system image is the root, read from flash");
+		if (ok) {
+			chdir("/");
+			check(bind_dir("/private/preboot/redwood", "/redwood"), "this image back on /redwood");
+		}
+		return;
+	}
 	check(synthetic_dir("/flash/redwood"), "a synthetic /redwood on it, for this image");
 	check(bind_dir(in_image("/LaunchDaemons"), "/flash/System/Library/LaunchDaemons") &&
 	    bind_dir(in_image("/empty"), "/flash/System/Library/NanoLaunchDaemons") &&
