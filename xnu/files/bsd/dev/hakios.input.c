@@ -229,7 +229,11 @@ hakios_input_init(void)
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
 	hakios_cpufreq_init();
 	hakios_virtio_input_init();
-	hakios_goodix_init();
+	if (hakios_is_raphael()) {
+		raphael_touch_init();
+	} else {
+		hakios_goodix_init();
+	}
 	hakios_buttons_init();
 	hakios_battery_init();
 	hakios_ufs_init();

@@ -3,8 +3,9 @@
 latency.py RUN.log [MORE.log ...] [RECORDING.raw]: how far behind the finger the phone's screen is.
 (More logs: the live ones of the same run, XL_FOLLOW=N XL_FOLLOW_KEEP=1, which keep what the run's log loses.)
 
-A run with boot-arg touch_lat=1 writes a line at every stage a touch passes on its way to the panel,
+A run with boot-arg touch_lat=2 writes a line at every stage a touch passes on its way to the panel,
 all in microseconds of mach_absolute_time (the kernel's clock, which user space reads too):
+touch_lat=1 also traces every SpringBoard main-loop turn; use 2 for bounded hardware diagnostics.
 
   tl: p TYPE FINGER X Y at US              the kernel posts a sample (bsd/dev/hakios.input.c)
   tl: c before US seen US read US          the touch driver finds the interrupt line low and reads the
