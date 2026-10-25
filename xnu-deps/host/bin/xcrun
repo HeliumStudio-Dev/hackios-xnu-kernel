@@ -20,7 +20,8 @@ case "$show" in
   platform) echo "${XNU_PLATFORM_PATH:-/Platforms/iPhoneOS.platform}"; exit 0;;
 esac
 if [ -n "$find" ]; then
-  for d in "$HB" /usr/bin; do [ -x "$d/$find" ] && { echo "$d/$find"; exit 0; }; done
+  [ -x "$HB/$find" ] && { echo "$HB/$find"; exit 0; }
+  command -v "$find" && exit 0
   [ "$(uname)" = Darwin ] && exec /usr/bin/xcrun -find "$find"
   exit 1
 fi

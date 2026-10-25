@@ -36,6 +36,7 @@ struct hakios_touch {
 };
 
 #ifdef KERNEL
+int hakios_is_raphael(void);
 /* For drivers; not from interrupt context. */
 void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 void hakios_input_init(void);

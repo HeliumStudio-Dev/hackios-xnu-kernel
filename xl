@@ -24,6 +24,7 @@
 #   xl state            where is the phone right now
 #
 # Logs land in logs/. Environment for `run`:
+#   XL_KERNEL   explicit kernel path; fails if missing instead of using a prebuilt
 #   XL_CMDLINE  extra kernel boot-args; default "-v": the boot is shown as text on the phone's screen
 #               (XL_CMDLINE="" for a blank screen, XL_CMDLINE="-v systrace=1" to trace failing syscalls)
 #   XL_SECS     seconds after which the kernel returns to the loader on its own (default 8)
@@ -47,8 +48,12 @@ cd "$(dirname "$(readlink -f "$0")")" || exit 1
 # On a Mac: flock, GNU timeout and stat, and Android's platform-tools, from tools/macos-bin (see its README)
 [ "$(uname)" = Darwin ] && PATH=$PWD/tools/macos-bin:$PWD/tools/macos-bin/platform-tools:$PATH
 # the kernel and the loader built here, or else the ones that come with the repository
-K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
-[ -f $K ] || K=prebuilt/mach.development.bcm2837
+K=${XL_KERNEL:-xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837}
+if [ -n "${XL_KERNEL:-}" ]; then
+	[ -f "$K" ] || { echo "xl: XL_KERNEL does not exist: $K" >&2; exit 1; }
+else
+	[ -f "$K" ] || K=prebuilt/mach.development.bcm2837
+fi
 L=xnuloader/loader.efi
 [ -f $L ] || L=prebuilt/loader.efi
 mkdir -p logs
@@ -154,7 +159,7 @@ run() { # run <oem command> <label>
 		local deadline=$(( $(date +%s) + ${XL_SECS:-8} + 100 )) followed=$(date +%s)
 		while :; do
 			result=$(FB_TIMEOUT=15 fb getvar result | grep '^result:')
-			case "$result" in ""|*running*) ;; *) break ;; esac
+			case "$result" in ""|"result:"|"result: "|*running*) ;; *) break ;; esac
 			[ "$(date +%s)" -ge "$deadline" ] && { result=; break; }
 			if [ -n "$XL_FOLLOW" ] && [ $(( $(date +%s) - followed )) -ge "$XL_FOLLOW" ]; then
 				followed=$(date +%s)

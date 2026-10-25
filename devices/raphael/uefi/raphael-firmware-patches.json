@@ -1,0 +1,73 @@
+[
+  {
+    "module": "DALSYSDxe/DALSYSDxe",
+    "original_sha256": "d0ac4eb2f2281f40af2776d772a739495118d99e8a12b998392baa9c4bd62f1c",
+    "patched_sha256": "14984e06fa16f5563774e767aa248145ba7c1079928497f3c1cc9874517541c3",
+    "changes": [
+      [
+        185686,
+        0,
+        1
+      ]
+    ]
+  },
+  {
+    "module": "UsbConfigDxe/UsbConfigDxe",
+    "original_sha256": "15015a1cd44f8af4f1bbeee48904d8acbc60b2ba54e07ecd8473b4abbf3e9977",
+    "patched_sha256": "65d8b61566196d972e52f01df6ca6b8f7ac5d42ffd840855be89b2bdf4e8ed30",
+    "changes": [
+      [
+        18884,
+        42,
+        17
+      ],
+      [
+        18885,
+        2,
+        0
+      ],
+      [
+        18887,
+        52,
+        20
+      ],
+      [
+        18976,
+        42,
+        17
+      ],
+      [
+        18977,
+        2,
+        0
+      ],
+      [
+        18979,
+        52,
+        20
+      ]
+    ]
+  },
+  {
+    "module": "ButtonsDxe/ButtonsDxe",
+    "original_sha256": "bdab864a977efdf04c01cef7bb86773417c2a78cc29d58b3d01937634739de9c",
+    "patched_sha256": "ccc0b1d8d3a041b9715ece5b9fb0e56ed0b6352b5a8213accc0626838ddce8d0",
+    "changes": [
+      [
+        14140,
+        81,
+        177
+      ],
+      [
+        14141,
+        32,
+        1
+      ],
+      [
+        14145,
+        51,
+        55
+      ]
+    ]
+  }
+]

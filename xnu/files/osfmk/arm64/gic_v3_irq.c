@@ -72,7 +72,7 @@
 
 #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
 #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
-#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
+static uint32_t gic_timer_intid = 27;       /* EL1 virtual timer PPI; overridden by the device profile */
 #define GIC_INTID_SPI_MIN       32
 #define GIC_INTID_SPURIOUS_MIN  1020
 #define GIC_SPI_MOST            48          /* attached at a time */
@@ -153,6 +153,8 @@ gic_send_sgi(uint32_t phys_id, uint32_t sgi)
 {
 	uint64_t aff0 = phys_id & 0xff, aff1 = (phys_id >> 8) & 0xff;
 
+	/* Publish the signal flags before the target can take its interrupt. */
+	__builtin_arm_dsb(DSB_ST);
 	__builtin_arm_wsr64("ICC_SGI1R_EL1", ((uint64_t)sgi << 24) | (aff1 << 16) | (1ULL << (aff0 & 15)));
 	__builtin_arm_isb(ISB_SY);
 }
@@ -310,7 +312,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 		}
 		gic_active_iar[cpu] = iar | GIC_IAR_TAKEN;
 
-		if (intid == GIC_INTID_VTIMER) {
+		if (intid == gic_timer_intid) {
 			/* same sequence as the FIQ path in sleh_fiq() */
 			getCpuDatap()->cpu_decrementer = -1; /* Large */
 			rtclock_intr(TRUE);
@@ -349,6 +351,8 @@ gic_v3_irq_quiesce(void)
 		return;         /* as early as this there is no interrupt, nor a cpu number to ask for */
 	}
 	cpu = cpu_number();
+	/* The loader's firmware has no handler for XNU's virtual timer. */
+	gic_mask(gic_timer_intid);
 	/* (what drivers had of the shared interrupts goes with this kernel: none of them may fire under the loader) */
 	for (unsigned i = 0; i < GIC_SPI_MOST; i++) {
 		uint32_t intid = gic_spi[i].intid;
@@ -418,7 +422,7 @@ gic_v3_irq_cpu_init(void)
 {
 	int cpu = cpu_number();
 	vm_offset_t gicr;
-	uint32_t mine = 1u << GIC_INTID_VTIMER;
+	uint32_t mine;
 
 	if (gicd_base == 0) {
 		DTEntry entry;
@@ -433,6 +437,11 @@ gic_v3_irq_cpu_init(void)
 		uint64_t const *reg = prop;
 		vm_offset_t soc_base = pe_arm_get_soc_base_phys();
 
+		PE_parse_boot_argn("gic_timer_irq", &gic_timer_intid, sizeof(gic_timer_intid));
+		if (gic_timer_intid < 16 || gic_timer_intid >= 32) {
+			panic("gic: virtual timer IRQ %u is not a PPI", gic_timer_intid);
+		}
+
 		simple_lock_init(&gic_spi_lock, 0);
 		gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
 		gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
@@ -443,6 +452,8 @@ gic_v3_irq_cpu_init(void)
 	} else if (gicr_cpu_base[cpu] != 0) {
 		return;
 	}
+
+	mine = 1u << gic_timer_intid;
 
 	/* System-register CPU interface */
 	__builtin_arm_wsr64("ICC_SRE_EL1", __builtin_arm_rsr64("ICC_SRE_EL1") | 1);
@@ -476,7 +487,7 @@ gic_v3_irq_cpu_init(void)
 	/* Virtual timer PPI (and those): Group 1 (IRQ), default priority, enabled */
 	gic_write32(gicr + GICR_IGROUPR0, gic_read32(gicr + GICR_IGROUPR0) | mine);
 	gic_write32(gicr + GICR_IGRPMODR0, gic_read32(gicr + GICR_IGRPMODR0) & ~mine);
-	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_INTID_VTIMER)) = GIC_PRIORITY_DEFAULT;
+	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(gic_timer_intid)) = GIC_PRIORITY_DEFAULT;
 	gic_write32(gicr + GICR_ISENABLER0, mine);
 
 	/* Distributor: affinity routing, Group 1 enabled (normally already so) */
@@ -502,7 +513,7 @@ gic_v3_irq_cpu_init(void)
 
 	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
 	kprintf("gic: v3, distributor %p, cpu %d's redistributor %p, virtual timer on PPI %d\n",
-	    (void *)gicd_base, cpu, (void *)gicr, GIC_INTID_VTIMER);
+	    (void *)gicd_base, cpu, (void *)gicr, gic_timer_intid);
 }
 
 #endif /* GENERIC_GIC_V3_IRQ */

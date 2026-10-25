@@ -7,18 +7,26 @@ into an Android boot image for `fastboot boot`.
 
 The boot shim copies the FD to its base and the payload to PAYLOAD_BASE.
 
-The UEFI pieces are taken from a Mu-Silicium tree built here (Mu-Silicium/, see devices/poco-x5-pro/uefi/README.md)
-or, when there is none, from devices/poco-x5-pro/prebuilt/.
+The UEFI pieces are taken from a Mu-Silicium tree built here (Mu-Silicium/, see uefi/README.md)
+or, when there is none, from prebuilt/uefi/.
 
 usage: mkxnuimg.py [-p payload.bin] [-o out.img]
+
+Another device (common/devices/<name>.conf, read by common/build.sh) sets these in the environment:
+  UEFI_TARGET   Mu-Silicium device name (default redwood)    UEFI_FD, DTB   files to use instead
+  FD_BASE, FD_SIZE, PAYLOAD_BASE                              addresses from its UEFI port's memory map
 """
 import argparse, gzip, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MU = os.path.join(HERE, 'Mu-Silicium')
 PREBUILT = os.path.join(HERE, 'devices', 'poco-x5-pro', 'prebuilt')
-FD_BASE, FD_SIZE = 0x9FD00000, 0x200000
-PAYLOAD_BASE, PAYLOAD_MAX = 0xF0000000, 0x04000000
+def env_int(name, default):
+    v = os.environ.get(name, '')
+    return int(v, 0) if v else default
+TARGET = os.environ.get('UEFI_TARGET') or 'redwood'
+FD_BASE, FD_SIZE = env_int('FD_BASE', 0x9FD00000), env_int('FD_SIZE', 0x200000)
+PAYLOAD_BASE, PAYLOAD_MAX = env_int('PAYLOAD_BASE', 0xF0000000), 0x04000000
 
 ap = argparse.ArgumentParser()
 ap.add_argument('-p', '--payload')
@@ -26,8 +34,8 @@ ap.add_argument('-o', '--output', default=os.path.join(HERE, 'xnu-redwood.img'))
 ap.add_argument('--mode', default='RELEASE')
 args = ap.parse_args()
 
-fd_path = os.path.join(MU, f'Build/redwoodPkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
-if os.path.isfile(fd_path):
+fd_path = os.environ.get('UEFI_FD') or os.path.join(MU, f'Build/{TARGET}Pkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
+if os.path.isfile(fd_path) and os.path.isdir(os.path.join(MU, 'BootShim')):
     shim_dir = os.path.join(MU, 'BootShim')
     for f in ('BootShim.elf', 'BootShim.bin'):
         try: os.unlink(os.path.join(shim_dir, f))
@@ -36,12 +44,15 @@ if os.path.isfile(fd_path):
                            f'CFLAGS=--target=aarch64-linux-gnu -DPAYLOAD_BASE={PAYLOAD_BASE:#x}'],
                           cwd=shim_dir, stdout=subprocess.DEVNULL)
     parts = {'shim': os.path.join(shim_dir, 'BootShim.bin'), 'fd': fd_path,
-             'dtb': os.path.join(MU, 'Resources/DTBs/redwood.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
+             'dtb': os.path.join(MU, f'Resources/DTBs/{TARGET}.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
              'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
 else:
+    if TARGET != 'redwood':
+        sys.exit(f'mkxnuimg: {TARGET} needs its own built UEFI and Mu-Silicium/BootShim; refusing redwood prebuilts')
     parts = {'shim': os.path.join(PREBUILT, 'BootShim.bin'), 'fd': os.path.join(PREBUILT, 'SILICIUM_UEFI.fd'),
              'dtb': os.path.join(PREBUILT, 'device-tree.dtb'), 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
              'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')}
+    if os.environ.get('UEFI_FD'): parts['fd'] = os.environ['UEFI_FD']
 shim = open(parts['shim'], 'rb').read()
 fd = open(parts['fd'], 'rb').read()
 assert len(fd) == FD_SIZE, hex(len(fd))
@@ -55,12 +66,15 @@ if args.payload:
     blob += b'\0' * (-len(blob) % 16)
     print(f'payload: {len(data)} bytes, bytesum={sum(data) & 0xffffffff:08x}')
 
+if os.environ.get('DTB'): parts['dtb'] = os.environ['DTB']
 dtb = open(parts['dtb'], 'rb').read()
 kernel = args.output + '.kernel~'
 open(kernel, 'wb').write(gzip.compress(blob, 6) + dtb)
 try:
+    # board "HACKiOS": how the loader of an installed phone tells which A/B slot's boot partition is its own
+    # (xnuloader/flashboot.c, ab_switch_back) -- an Android boot image never has that name
     subprocess.check_call([sys.executable, parts['mkbootimg'], '--kernel', kernel, '--ramdisk', parts['ramdisk'],
-                           '--header_version', '1', '-o', args.output])
+                           '--header_version', '1', '--board', 'HACKiOS', '-o', args.output])
 finally:
     os.unlink(kernel)
 print(f'{args.output}: {os.path.getsize(args.output)} bytes (shim {len(shim)}, uncompressed {len(blob)})')

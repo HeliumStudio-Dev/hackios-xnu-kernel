@@ -324,13 +324,14 @@ compose_logs(const char *klog, uint64_t klog_len)
 
 static int hc_list_is_uefis(void);
 static int hc_log_skips;                /* logs not written this run (said twice at most) */
+static int persist_logs;
 static void hc_print_state(const char *when);
 static void hc_take_back(const char *when);
 
 static void
 write_logs(const char *klog, uint64_t klog_len)
 {
-	efi_block_io *bio = find_log_partition();
+	efi_block_io *bio = persist_logs ? find_log_partition() : NULL;
 
 	compose_logs(klog, klog_len);
 	if (bio == NULL) {
@@ -549,6 +550,12 @@ static const struct platform platform_redwood = {
 	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
 	 */
 	.small_cores = 0x0f,
+};
+
+static const struct platform platform_raphael = {
+	.name = "raphael", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000,
+	.cores = 8, .core_shift = 8, .small_cores = 0x0f,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -3042,6 +3049,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_u32(&w, "#size-cells", 2);
 
 	dt_begin(&w, "chosen");
+	dt_prop_str(&w, "hackios,platform", plat->name);
 	dt_prop(&w, "random-seed", seed, sizeof(seed));
 	dt_prop_u64(&w, "dram-base", phys_base);
 	dt_prop_u64(&w, "dram-size", win_size);
@@ -3728,9 +3736,9 @@ fb_command(char *cmd)
 			int have_cp = selftest || (*arg >= '0' && *arg <= '9');
 			uint64_t cp = selftest ? CHECKPOINT_SELFTEST : parse_number(arg, 10);
 
+			log_len = 0;
 			set_result("running", cp, 0);
 			fb_reply("OKAY", "");
-			log_len = 0;
 			print("== XNULOADER run (usb) ==\n");
 			if (!run_kernel(have_cp, cp)) {
 				set_result("not-started", 0, 0);
@@ -3931,13 +3939,14 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.height = GOP->mode->info->height;
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
-			PLAT = &platform_redwood;
+			PLAT = SCREEN.base == 0x9c000000 ? &platform_raphael : &platform_redwood;
 		} else {
 			ramfb_phone_screen();
 		}
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	persist_logs = PLAT == &platform_redwood;
 
 	install_exception_hook();
 	wdt_arm();
