@@ -100,11 +100,15 @@
 #include <sys/stat.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
+#include <vm/memory_types.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 
+/* SM8150 variants below follow zundamon_raphael drivers/gpu/msm and gpucc/debugcc-sm8150. */
+static bool a640;
 static uint32_t last_step, skip_steps, pause_ms = 2200, fine, watch_seconds = 20;
 static uint32_t step;                   /* the one being performed */
 static uint32_t speed_bin;              /* which of the GPUs of this kind the fuses say this is (step 2) */
@@ -283,7 +287,7 @@ wait_for(struct block *b, uint32_t offset, uint32_t mask, uint32_t value, uint32
  * gcc-sc7280.c. The touch screen driver uses this controller too.
  */
 static struct block gcc = { "gcc", 0x00100000, 0x80000 };
-#define GCC_PLL_VOTE            0x52000         /* bit 15: gcc_gpu_gpll0_clk_src (600 MHz), bit 16: ..._div_clk_src (300 MHz) */
+#define GCC_PLL_VOTE            (a640 ? 0x52004u : 0x52000u)         /* bit 15: gcc_gpu_gpll0_clk_src (600 MHz), bit 16: ..._div_clk_src (300 MHz) */
 #define GCC_PLL_VOTE_GPU_DIV    (1u << 16)
 #define GCC_GPU_CFG_AHB_CBCR    0x71004
 #define GCC_GPU_MEMNOC_GFX_CBCR 0x7100c
@@ -293,7 +297,7 @@ static struct block gcc = { "gcc", 0x00100000, 0x80000 };
 #define CBCR_OFF                (1u << 31)      /* ... and whether it is in fact off */
 
 /* dt: reserved-memory cmd_db@80860000: the boot loader's list of what RPMh can switch (cmd-db.c) */
-#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_PHYS             (a640 ? 0x85f20000UL : 0x80860000UL)
 #define CMD_DB_SIZE             0x20000UL
 
 struct cmd_db_slave {
@@ -435,6 +439,13 @@ step_fuses(void)
 {
 	uint32_t bin, gaming;
 
+	if (a640) {
+		/* DT qcom,gpu-speed-bin: corrected fuse 0x4130, bits 31:29. */
+		speed_bin = get(&qfprom, "speed bin", 0x4130) >> 29;
+		printf("adreno: %u: Adreno 640 v2, speed bin %u\n", step, speed_bin);
+		return true;
+	}
+
 	announce("read the GPU's fuses in the error-corrected copy (0x784000), which Linux reads");
 	bin = get8(&qfprom, "speed bin, low", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN);
 	bin |= get8(&qfprom, "speed bin, high", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN + 1) << 8;
@@ -476,7 +487,7 @@ static struct block gpucc = { "gpucc", 0x03d90000, 0x9000 };
 #define GPUCC_HUB_RCGR          0x117c          /* gpu_cc_hub_clk_src */
 #define GPUCC_HUB_CX_INT_CBCR   0x1204          /* gpu_cc_hub_cx_int_clk */
 #define GPUCC_CX_HW_CTRL        0x1540          /* dt: gpu_cx_hw_ctrl: bit 31 is where the vendor's driver sees CX come on */
-#define GPUCC_GX_DOMAIN_MISC    0x158c          /* dt: gpu_gx_domain_addr */
+#define GPUCC_GX_DOMAIN_MISC    (a640 ? 0x1508u : 0x158cu) /* dt: gpu_gx_domain_addr */
 #define GPUCC_SMMU_VOTE_CBCR    0x5000          /* gpu_cc_hlos1_vote_gpu_smmu_clk: our vote for the SMMU's clock */
 
 #define GDSC_SW_COLLAPSE        (1u << 0)       /* a power switch's control register (gdsc.c): off, by software */
@@ -506,17 +517,21 @@ step_gpucc(void)
 	get(&gpucc, "pll1 multiplier", GPUCC_PLL1_MODE + 4);
 	get(&gpucc, "gmu_clk_src command", GPUCC_GMU_RCGR);
 	get(&gpucc, "gmu_clk_src source", GPUCC_GMU_RCGR + 4);
-	get(&gpucc, "hub_clk_src command", GPUCC_HUB_RCGR);
-	get(&gpucc, "hub_clk_src source", GPUCC_HUB_RCGR + 4);
+	if (!a640) {
+		get(&gpucc, "hub_clk_src command", GPUCC_HUB_RCGR);
+		get(&gpucc, "hub_clk_src source", GPUCC_HUB_RCGR + 4);
+	}
 	get(&gpucc, "cxo_aon", GPUCC_CXO_AON_CBCR);
 	get(&gpucc, "gx_gmu", GPUCC_GX_GMU_CBCR);
 	get(&gpucc, "ahb", GPUCC_AHB_CBCR);
 	get(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR);
 	get(&gpucc, "cxo", GPUCC_CXO_CBCR);
-	get(&gpucc, "cb", GPUCC_CB_CBCR);
-	get(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
-	get(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
-	get(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR);
+	if (!a640) {
+		get(&gpucc, "cb", GPUCC_CB_CBCR);
+		get(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
+		get(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
+		get(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR);
+	}
 	return true;
 }
 
@@ -669,18 +684,18 @@ step_clocks(void)
 
 	announce("in the GPU's clock controller: the GMU's clock to 200 MHz, the hub's to 150 MHz");
 	if (!clock_source("gmu_clk_src", GPUCC_GMU_RCGR, RCG_GPLL0_DIV(3)) ||       /* 300 MHz / 1.5 */
-	    !clock_source("hub_clk_src", GPUCC_HUB_RCGR, RCG_GPLL0_DIV(4))) {       /* 300 MHz / 2 */
+	    (!a640 && !clock_source("hub_clk_src", GPUCC_HUB_RCGR, RCG_GPLL0_DIV(4)))) {       /* 300 MHz / 2 */
 		return false;
 	}
 
 	announce("in the GPU's clock controller: the clocks of the GMU and of the SMMU on");
-	if (!clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false) ||
+	if ((!a640 && !clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false)) ||
 	    !clock_on(&gpucc, "cxo", GPUCC_CXO_CBCR, true) ||
 	    !clock_on(&gpucc, "ahb", GPUCC_AHB_CBCR, false) ||
-	    !clock_on(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR, true) ||
-	    !clock_on(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR, true) ||
+	    (!a640 && !clock_on(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR, true)) ||
+	    (!a640 && !clock_on(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR, true)) ||
 	    !clock_on(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true) ||
-	    !clock_on(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR, false)) {
+	    (!a640 && !clock_on(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR, false))) {
 		return false;
 	}
 	return measure_clocks();
@@ -696,10 +711,10 @@ step_clocks(void)
  * clk-debug.c (mainline Linux has no counterpart).
  */
 #define GCC_DEBUG_MUX           0x62000         /* [9:0] which clock goes to the counter */
-#define GCC_DEBUG_MUX_GPUCC     0x146           /* ... the debug output of the GPU's clock controller */
+#define GCC_DEBUG_MUX_GPUCC     (a640 ? 0x162u : 0x146u)           /* ... the debug output of the GPU's clock controller */
 #define GCC_DEBUG_DIV           0x62004         /* [3:0] divider - 1; both controllers divide by 2 */
 #define GCC_DEBUG_CBCR          0x62008
-#define GCC_XO_DIV4_CBCR        0x6200c         /* the counter's time base: the crystal / 4, 4.8 MHz */
+#define GCC_XO_DIV4_CBCR        (a640 ? 0x43008u : 0x6200cu)         /* the counter's time base: the crystal / 4, 4.8 MHz */
 #define GCC_MEASURE_CTL         0x62038         /* [19:0] how many ticks of the time base to count for */
 #define MEASURE_RUN             (1u << 20)
 #define MEASURE_CLEAR           (1u << 21)
@@ -711,12 +726,12 @@ step_clocks(void)
 #define GPUCC_DEBUG_DIV         0x10fc
 #define GPUCC_DEBUG_CBCR        0x1100
 #define GPUCC_DEBUG_MUX         0x1568          /* [7:0] which of the GPU's clocks */
-#define GPUCC_DEBUG_CXO_AON     0x0b
-#define GPUCC_DEBUG_GX_GFX3D    0x0d            /* the 3D core's own clock */
-#define GPUCC_DEBUG_GX_GMU      0x11
-#define GPUCC_DEBUG_AHB         0x12
-#define GPUCC_DEBUG_CX_GMU      0x1a
-#define GPUCC_DEBUG_CXO         0x1b
+#define GPUCC_DEBUG_CXO_AON     (a640 ? 0x0au : 0x0bu)
+#define GPUCC_DEBUG_GX_GFX3D    (a640 ? 0x0bu : 0x0du)            /* the 3D core's own clock */
+#define GPUCC_DEBUG_GX_GMU      (a640 ? 0x0fu : 0x11u)
+#define GPUCC_DEBUG_AHB         (a640 ? 0x10u : 0x12u)
+#define GPUCC_DEBUG_CX_GMU      (a640 ? 0x18u : 0x1au)
+#define GPUCC_DEBUG_CXO         (a640 ? 0x19u : 0x1bu)
 #define GPUCC_DEBUG_HUB_CX_INT  0x1c
 #define GPUCC_DEBUG_CB          0x26
 #define GPUCC_DEBUG_HUB_AON     0x27
@@ -800,7 +815,7 @@ measure_quietly(uint32_t select)
 static bool
 measure_clocks(void)
 {
-	static const struct {
+	const struct {
 		const char *name;
 		uint32_t select;
 	} clocks[] = {
@@ -823,6 +838,9 @@ measure_clocks(void)
 		return false;
 	}
 	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
+		if (a640 && i >= 1 && i <= 3) {
+			continue; /* SM8150 has no HUB/CB clocks. */
+		}
 		hz = measure_quietly(clocks[i].select);
 		if (hz == MEASURE_FAILED) {
 			printf("adreno: %u: measured: %s: the counter did not finish\n", step, clocks[i].name);
@@ -1184,7 +1202,7 @@ step_gmu_memory(void)
 
 #define SMMU_S2CR_FAULT         (2u << 16)
 #define SMMU_SMR_VALID          (1u << 31)
-#define SMMU_STREAM_MASK        0x400           /* dt: the second cell of every "iommus" of this SMMU */
+#define SMMU_STREAM_MASK        0x400           /* A640's combined GPU stream uses 0x401 instead. */
 #define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)       /* our tables alone decide; weakest defaults */
 #define SMMU_CBA2R(n)           (0x800 + 4 * (n))                       /* in the second page, like CBAR */
 #define SMMU_CBA2R_64_BIT       1
@@ -1430,12 +1448,20 @@ static bool
 space_on(struct gpu_space *space, uint32_t match, uint32_t stream)
 {
 	uint32_t context = smmu_context(space);
+	uint32_t mask = a640 && stream == 0 ? 0x401 : SMMU_STREAM_MASK;
 	uint64_t root = space->tables[0].phys | (uint64_t)space->context << 48;        /* tagged with the context's number */
 
 	for (uint32_t i = 0; i < space->table_count; i++) {
 		to_memory((vm_offset_t)space->tables[i].table, 4096);
 	}
 	put(&smmu, "cb sctlr", context + SMMU_CB_SCTLR, 0);
+	if (a640) {
+		/* SM8150 qcom,actlr = <0 0x407 0x303>, for GPU and GMU streams. */
+		put(&smmu, "cb actlr", context + 4, 0x303);
+		if (get(&smmu, "cb actlr", context + 4) != 0x303) {
+			return false;
+		}
+	}
 	put(&smmu, "cba2r", smmu_page + SMMU_CBA2R(space->context), SMMU_CBA2R_64_BIT);
 	put(&smmu, "cbar", smmu_page + SMMU_CBAR(space->context), SMMU_CBAR_STAGE_1);
 	put(&smmu, "cb tcr2", context + SMMU_CB_TCR2, SMMU_TCR2);
@@ -1456,10 +1482,10 @@ space_on(struct gpu_space *space, uint32_t match, uint32_t stream)
 	}
 	put(&smmu, "cb sctlr", context + SMMU_CB_SCTLR, SMMU_SCTLR_ON | space->control);
 	put(&smmu, "s2cr", SMMU_S2CR(match), space->context);
-	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream);
+	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | mask << 16 | stream);
 
 	/* the global ones are the hypervisor's to grant: see what it made of them */
-	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream) ||
+	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | mask << 16 | stream) ||
 	    (get(&smmu, "s2cr", SMMU_S2CR(match)) & 0x300ff) != space->context ||
 	    (get(&smmu, "cbar", smmu_page + SMMU_CBAR(space->context)) & 0x30000) != (SMMU_CBAR_STAGE_1 & 0x30000) ||
 	    !(get(&smmu, "cb sctlr", context + SMMU_CB_SCTLR) & 1) ||
@@ -1648,7 +1674,7 @@ zap_header(uint64_t *phys)
 	uint64_t size = 0;
 	uint32_t segments, hashes;
 
-	header = image_file("fw", "a660_zap.mdt", &size);
+	header = image_file("fw", a640 ? "a640_zap.mdt" : "a660_zap.mdt", &size);
 	if (header == NULL) {
 		return false;
 	}
@@ -1709,7 +1735,7 @@ step_zap_signature(void)
  * message protocol ("HFI").
  */
 #define GMU_ITCM_ADDRESS        0x00000000u
-#define GMU_DTCM_ADDRESS        0x10004000u     /* a6xx_gmu_fw_load: the 650 family's */
+#define GMU_DTCM_ADDRESS        (a640 ? 0x00040000u : 0x10004000u)     /* a6xx_gmu_fw_load: the 650 family's */
 #define GMU_TCM_SIZE            0x4000u
 #define GMU_LOG_ADDRESS         0x60002000u     /* after the two pages the firmware asks for at 0x60000000 */
 #define GMU_LOG_SIZE            0x4000u
@@ -1737,6 +1763,22 @@ in_tcm(uint32_t address)
 	return address - GMU_ITCM_ADDRESS < GMU_TCM_SIZE || address - GMU_DTCM_ADDRESS < GMU_TCM_SIZE;
 }
 
+/* Reject truncated, unaligned or overflowing vendor blocks before any MMIO firmware copy. */
+static bool
+gmu_block_read(uint64_t *at, struct gmu_firmware_block *block)
+{
+	if (*at > gmu_firmware_size || gmu_firmware_size - *at < sizeof(*block)) {
+		return false;
+	}
+	memcpy(block, gmu_firmware + *at, sizeof(*block));
+	if ((block->size & 3u) || block->size > gmu_firmware_size - *at - sizeof(*block) ||
+	    (uint64_t)block->address + block->size > 0x100000000ull) {
+		return false;
+	}
+	*at += sizeof(*block) + block->size;
+	return true;
+}
+
 static bool
 step_gmu_space(void)
 {
@@ -1744,16 +1786,22 @@ step_gmu_space(void)
 		return false;
 	}
 	announce("find the GMU's firmware, fw/a660_gmu.bin, in the small image, and make the memory it asks for");
-	gmu_firmware = image_file("fw", "a660_gmu.bin", &gmu_firmware_size);
+	gmu_firmware = image_file("fw", a640 ? "a640_gmu.bin" : "a660_gmu.bin", &gmu_firmware_size);
 	if (gmu_firmware == NULL) {
 		return false;
 	}
-	for (uint64_t at = 0; at + sizeof(struct gmu_firmware_block) <= gmu_firmware_size;) {
+	/* A640 predates allocation metadata: the two cache VMAs are fixed by its firmware ABI. */
+	if (a640) {
+		if (!block_new(&gmu_space, &gmu_blocks[gmu_block_count++], 0x4000, 0x3c000, PTE_GMU) ||
+		    !block_new(&gmu_space, &gmu_blocks[gmu_block_count++], 0x44000, 0x3c000, PTE_GMU) ||
+		    !block_new(&gmu_space, &gmu_blocks[gmu_block_count++], 0x60000000, 0x1000, PTE_GMU)) {
+			return false;
+		}
+	}
+	for (uint64_t at = 0; at < gmu_firmware_size;) {
 		struct gmu_firmware_block block;
 
-		memcpy(&block, gmu_firmware + at, sizeof(block));
-		at += sizeof(block) + block.size;
-		if (at > gmu_firmware_size) {
+		if (!gmu_block_read(&at, &block)) {
 			printf("adreno: %u: the file ends inside a block\n", step);
 			return false;
 		}
@@ -1798,12 +1846,13 @@ step_gmu_firmware(void)
 	    "0x3d71000), the rest into the memory just made");
 	put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
 	for (int pass = 0; pass < 2; pass++) {
-		for (uint64_t at = 0; at + sizeof(struct gmu_firmware_block) <= gmu_firmware_size;) {
+		for (uint64_t at = 0; at < gmu_firmware_size;) {
 			struct gmu_firmware_block block;
 			const uint8_t *data = gmu_firmware + at + sizeof(block);
 
-			memcpy(&block, gmu_firmware + at, sizeof(block));
-			at += sizeof(block) + block.size;
+			if (!gmu_block_read(&at, &block)) {
+				return false;
+			}
 			if (block.size == 0) {
 				continue;
 			}
@@ -1875,10 +1924,17 @@ step_gmu_firmware(void)
 #define GMU_RSCC_CONTROL_REQ    GMU_WORD(0x9307)
 #define GMU_AO_AHB_FENCE_CTRL   GMU_WORD(0x9310)
 #define GMU_AHB_FENCE_RANGE_0   GMU_WORD(0x9311)
-#define GMU_CHIP                0x06035000      /* dt qcom,chipid 0x06030500 the way the firmware wants it */
+#define GMU_CHIP                (a640 ? 0x06040100u : 0x06035000u)      /* dt qcom,chipid 0x06030500 the way the firmware wants it */
 #define GMU_STARTED_MASK        0x1ff           /* of fw_init_result, for firmware newer than core 0x20010004 */
 #define GMU_STARTED             0x100
 #define GMU_FAILED              0xe00
+
+static bool
+gmu_has_failed(uint32_t result)
+{
+	/* The legacy success word itself contains bits that newer firmware uses for errors. */
+	return a640 ? result != 0xbabefaceu : (result & GMU_FAILED) != 0;
+}
 
 /* The table at the head of the HFI page and the three queues after it, as the vendor's driver lays them out. */
 struct hfi_queue {
@@ -1898,11 +1954,15 @@ static volatile struct hfi_table *hfi;  /* the uncached view */
  * Everything the vendor's driver writes before it lets the processor go (a6xx_gmu_register_config,
  * a6xx_gmu_power_config), in its order; then out of reset (a6xx_gmu_device_start).
  */
+static bool program_sequencers(void);
+
 static bool
 step_gmu_start(void)
 {
 	static const uint8_t priority[HFI_QUEUES] = { 10, 10, 40 };
 	uint32_t result = 0;
+	uint32_t started_mask = a640 ? ~0u : GMU_STARTED_MASK;
+	uint32_t started = a640 ? 0xbabefaceu : GMU_STARTED;
 
 	if (!cx_ready() || !gmu_space_is_on) {
 		return false;
@@ -1934,6 +1994,9 @@ step_gmu_start(void)
 	 * until it is taken back nothing the GMU asks of RPMh gets there: the vendor's
 	 * a6xx_rscc_wakeup_sequence, before the firmware starts.
 	 */
+	if (a640 && !program_sequencers()) {
+		return false;
+	}
 	rscc_show();
 	if (rd(rscc.base + RSCC_RSC_STATUS0_DRV0) & RSCC_ASLEEP) {
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 2);
@@ -1946,8 +2009,10 @@ step_gmu_start(void)
 		get(&rscc, "seq_busy_drv0", RSCC_SEQ_BUSY_DRV0);
 	}
 	rsc_awake = true;
-	put(&gmu, "cx_falnext_intf", GMU_CX_FALNEXT_INTF, 1);
-	put(&gmu, "cx_fal_intf", GMU_CX_FAL_INTF, 1);
+	if (!a640) {
+		put(&gmu, "cx_falnext_intf", GMU_CX_FALNEXT_INTF, 1);
+		put(&gmu, "cx_fal_intf", GMU_CX_FAL_INTF, 1);
+	}
 	put(&gmu, "general_7", GMU_GENERAL_7, 1);
 	put(&gmu, "cm3_fw_init_result", GMU_CM3_FW_INIT_RESULT, 0);
 	put(&gmu, "cm3_boot_config", GMU_CM3_BOOT_CONFIG, 2);
@@ -1968,7 +2033,7 @@ step_gmu_start(void)
 
 	gmu_runs = true;
 	put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 0);
-	for (int i = 0; i < 5000 && (result & GMU_STARTED_MASK) != GMU_STARTED && !(result & GMU_FAILED); i++) {
+	for (int i = 0; i < 5000 && (result & started_mask) != started && (a640 || !(result & GMU_FAILED)); i++) {
 		sleep_us(100);
 		result = rd(gmu.base + GMU_CM3_FW_INIT_RESULT);
 	}
@@ -1976,7 +2041,7 @@ step_gmu_start(void)
 	get(&gmu, "gmu2host_intr_info", GMU_GMU2HOST_INTR_INFO);
 	get(&gmu, "ao_host_interrupt_status", GMU_AO_HOST_INTERRUPT_STATUS);
 	get(&gmu, "hfi_ctrl_status", GMU_HFI_CTRL_STATUS);
-	if (space_faulted(&gmu_space) || (result & GMU_STARTED_MASK) != GMU_STARTED) {
+	if (space_faulted(&gmu_space) || (result & started_mask) != started) {
 		printf("adreno: %u: the GMU's firmware does not come up\n", step);
 		gmu_post_mortem();
 		return false;
@@ -1995,6 +2060,7 @@ step_gmu_start(void)
  * firmware has started and before the message queues are).
  */
 static struct block pdc = { "pdc", 0x0b290000, 0x10000 };       /* dt: qcom,gmu "kgsl_gmu_pdc_cfg" */
+static struct block pdc_seq = { "pdc_seq", 0x0b490000, 0x10000 };
 #define PDC_GPU_ENABLE          (4 * 0x1140)
 #define PDC_GPU_SEQ_START_ADDR  (4 * 0x1148)
 #define RSCC_PDC_SEQ_START_ADDR (4 * 0x008)
@@ -2005,12 +2071,42 @@ static struct block pdc = { "pdc", 0x0b290000, 0x10000 };       /* dt: qcom,gmu 
 #define RSCC_OVERRIDE_START_ADDR (4 * 0x100)
 
 static bool
-step_gmu_queues(void)
+program_sequencers(void)
 {
-	static const uint32_t program[5] = { 0xeaaae5a0, 0xe1a1ebab, 0xa2e0a581, 0xecac82e2, 0x0020edad };
+	const uint32_t program[5] = {
+		a640 ? 0xa7a506a0 : 0xeaaae5a0, a640 ? 0xa1e6a6e7 : 0xe1a1ebab,
+		a640 ? 0xa2e081e1 : 0xa2e0a581, a640 ? 0xe9a982e2 : 0xecac82e2,
+		a640 ? 0x0020e8a8 : 0x0020edad
+	};
+	uint32_t hidden = a640 ? 0x80000000 : 0x80000021;
 
-	if (!cx_ready() || !gmu_runs) {
+	if (!cx_ready()) {
 		return false;
+	}
+	if (a640) {
+		/* A640's PDC program is supplied by the host, unlike 642L's AOP. */
+		static const uint32_t sequence[] = { 0xfebea1e1, 0xa5a4a3a2, 0x8382a6e0, 0xbce3e284, 0x002081fc };
+		uint32_t address[] = { rpmh_resource("mx.lvl", NULL, NULL), rpmh_resource("cx.lvl", NULL, NULL),
+			rpmh_resource("xo.lvl", NULL, NULL) };
+		if (!address[0] || !address[1] || !address[2]) {
+			printf("adreno: PDC is missing RPMh mx/cx/xo resources\n");
+			return false;
+		}
+		for (unsigned i = 0; i < 5; i++) {
+			put(&pdc_seq, "sequence", 4 * i, sequence[i]);
+		}
+		for (unsigned t = 0; t < 2; t++) {
+			uint32_t control = 4 * (t ? 0x15d6 : 0x1572);
+			const uint32_t data[2][3] = { { 1, 0, 0 }, { 2, 3, 3 } };
+			put(&pdc, "TCS control", control, 0);
+			put(&pdc, "TCS enable", control + 4, 7);
+			put(&pdc, "TCS wait", control + 8, 0);
+			for (unsigned i = 0; i < 3; i++) {
+				put(&pdc, "TCS msgid", control + 12 + 16 * i, 0x10108);
+				put(&pdc, "TCS address", control + 16 + 16 * i, address[i]);
+				put(&pdc, "TCS data", control + 20 + 16 * i, data[t][i]);
+			}
+		}
 	}
 	announce("enable the GPU's part of the always-on sequencer (pdc, 0xb294500 and 0xb294520: a part of the SoC not "
 	    "touched before)");
@@ -2022,7 +2118,7 @@ step_gmu_queues(void)
 
 	announce("give the GMU's RPMh channel its sleep and wake program (rscc, 0x3de0000), unless it has it");
 	if (get(&rscc, "seq_mem_0_drv0", RSCC_SEQ_MEM_0_DRV0) == program[0] &&
-	    get(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4) == 0x80000021) {
+	    get(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4) == hidden) {
 		goto programmed;
 	}
 	put(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0, 1u << 24);
@@ -2031,7 +2127,7 @@ step_gmu_queues(void)
 	put(&rscc, "hidden_tcs_cmd0_addr", RSCC_HIDDEN_TCS_CMD0_ADDR, 0);
 	put(&rscc, "hidden_tcs_cmd1_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 2, 0);
 	put(&rscc, "hidden_tcs_cmd1_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 2, 0);
-	put(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4, 0x80000021);    /* a650 and later */
+	put(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4, hidden);
 	put(&rscc, "hidden_tcs_cmd2_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 4, 0);
 	put(&rscc, "override_start_addr", RSCC_OVERRIDE_START_ADDR, 0);
 	put(&rscc, "pdc_seq_start_addr", RSCC_PDC_SEQ_START_ADDR, 0x4520);
@@ -2043,6 +2139,15 @@ step_gmu_queues(void)
 	get(&rscc, "seq_mem_0_drv0", RSCC_SEQ_MEM_0_DRV0);
 
 programmed:
+	return true;
+}
+
+static bool
+step_gmu_queues(void)
+{
+	if (!cx_ready() || !gmu_runs || (!a640 && !program_sequencers())) {
+		return false;
+	}
 	announce("ask the GMU to start its message queues");
 	put(&gmu, "hfi_ctrl_init", GMU_HFI_CTRL_INIT, 1);
 	if (!wait_for(&gmu, GMU_HFI_CTRL_STATUS, 1, 1, 500)) {
@@ -2170,7 +2275,7 @@ gmu_post_mortem(void)
 		    log[4 * i + 8], log[4 * i + 9], log[4 * i + 10], log[4 * i + 11],
 		    log[4 * i + 12], log[4 * i + 13], log[4 * i + 14], log[4 * i + 15]);
 	}
-	for (uint32_t i = 0; i < 24; i += 8) {
+	for (uint32_t i = 0; !a640 && i < 24; i += 8) {
 		printf("adreno: %u: the GMU's state +%#x: %x %x %x %x %x %x %x %x\n", step, 4 * i,
 		    gmu_data(GMU_STATE_ADDRESS + 4 * i), gmu_data(GMU_STATE_ADDRESS + 4 * i + 4),
 		    gmu_data(GMU_STATE_ADDRESS + 4 * i + 8), gmu_data(GMU_STATE_ADDRESS + 4 * i + 12),
@@ -2218,7 +2323,7 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 			wr(gmu.base + GMU_GMU2HOST_INTR_CLR, 1);
 			answered = hfi_receive(1, number, &verdict);
 		}
-		if (rd(gmu.base + GMU_CM3_FW_INIT_RESULT) & GMU_FAILED) {
+		if (gmu_has_failed(rd(gmu.base + GMU_CM3_FW_INIT_RESULT))) {
 			break;
 		}
 	}
@@ -2255,6 +2360,7 @@ rail_vote(uint32_t level, const uint16_t *rail, unsigned rail_levels, const uint
 	while (with + 1 < mx_levels && mx[with] < rail[at]) {
 		with++;
 	}
+	if (mx[with] < rail[at]) return false;
 	*vote = (uint32_t)rail[at] << 16 | with << 8 | at;
 	return true;
 }
@@ -2282,9 +2388,12 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 static bool
 step_core_power(void)
 {
-	static const struct {
+	const struct {
 		uint32_t khz, level;
-	} speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
+	} speeds[] = { { 0, 0 }, { a640 ? 257000 : 315000, 64 },
+		{ a640 ? 345000 : 450000, 128 }, { a640 ? 427000 : 550000, 192 },
+		/* zundamon-miui sm8150-gpu-v2: 585/164 and 765/310 round up to RPMh 192/320. */
+		{ 585000, 192 }, { 765000, 320 } };
 	static struct hfi_perf_table perf;
 	static struct hfi_bw_table bw;
 	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 3, HFI_NO_INDEX }, granted = 0, speed = 0;
@@ -2299,7 +2408,7 @@ step_core_power(void)
 		printf("adreno: %u: RPMh's list lacks one of the rails\n", step);
 		return false;
 	}
-	perf.gpu_levels = sizeof(speeds) / sizeof(speeds[0]);
+	perf.gpu_levels = a640 ? sizeof(speeds) / sizeof(speeds[0]) : 4;
 	for (unsigned i = 0; i < perf.gpu_levels; i++) {
 		perf.gpu[i].khz = speeds[i].khz;
 		perf.gpu[i].acd = 0xffffffff;           /* no adaptive clocking */
@@ -2335,11 +2444,18 @@ step_core_power(void)
 		return false;
 	}
 
-	if (PE_parse_boot_argn("adreno_speed", &speed, sizeof(speed)) && speed >= 1 && speed < perf.gpu_levels) {
+	if (PE_parse_boot_argn("adreno_speed", &speed, sizeof(speed))) {
+		if (speed < 1 || speed >= perf.gpu_levels) {
+			printf("adreno: invalid speed index %u (this GPU has %u active levels)\n", speed, perf.gpu_levels - 1);
+			return false;
+		}
 		vote[2] = speed;
 	}
+	if (a640 && speed == 0) {
+		vote[2] = 4;
+	}
 	core_khz = speeds[vote[2]].khz;
-	printf("adreno: %u: the speed wanted: %u MHz\n", step, core_khz / 1000);
+	printf("adreno: %u: the speed wanted: %u MHz, RPMh vote %#x\n", step, core_khz / 1000, perf.gpu[vote[2]].vote);
 	announce("send the GMU its tables (speeds and supply levels, bus votes), \"start\", and the speed wanted; "
 	    "from here on it casts votes in RPMh by itself");
 	if (!hfi_send("the table of speeds", HFI_PERF_TABLE, &perf.header, sizeof(perf) / 4) ||
@@ -2371,8 +2487,13 @@ step_core_power(void)
 	if (!hfi_send("\"start\"", HFI_START, start, 1)) {
 		return false;
 	}
+	uint32_t measured = measure_quietly(GPUCC_DEBUG_GX_GFX3D);
 	printf("adreno: %u: measured: the 3D core's clock runs at %u Hz (%u MHz was asked for), the GMU's in it at %u Hz\n", step,
-	    measure_quietly(GPUCC_DEBUG_GX_GFX3D), core_khz / 1000, measure_quietly(GPUCC_DEBUG_GX_GMU));
+	    measured, core_khz / 1000, measure_quietly(GPUCC_DEBUG_GX_GMU));
+	if (a640 && (measured < core_khz * 990u || measured > core_khz * 1010u)) {
+		printf("adreno: the requested clock did not take effect\n");
+		return false;
+	}
 
 	announce("read registers of the 3D core itself (0x3d00000): the first time it has power");
 	get(&gpu, "rbbm_status", RBBM_STATUS);
@@ -2562,9 +2683,13 @@ step_core_space(void)
 	if (!cx_ready() || !core_is_on) {
 		return false;
 	}
-	PE_parse_boot_argn("adreno_stream1", &stream1, sizeof(stream1));
+	if (a640) {
+		stream1 = 0; /* SM8150 DT groups streams 0/1 in one 0x401 match. */
+	} else {
+		PE_parse_boot_argn("adreno_stream1", &stream1, sizeof(stream1));
+	}
 	announce("make the 3D core's memory: its ring, its microcode (fw/a660_sqe.fw), a page to try writing to");
-	microcode = image_file("fw", "a660_sqe.fw", &size);
+	microcode = image_file("fw", a640 ? "a630_sqe.fw" : "a660_sqe.fw", &size);
 	if (microcode == NULL || size < 8 || size > 0x40000 ||
 	    !block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, PTE_CORE) ||
 	    !block_new(&core_space, &core_sqe, CORE_SQE_ADDRESS, (uint32_t)size - 4, PTE_CORE | PTE_READ_ONLY) ||
@@ -2620,7 +2745,7 @@ step_core_space(void)
  * (Step 21 is what tells whether the 3D core gets out of secure mode with it.) There was a
  * boot-arg adreno_zap=0 for the second and later runs of a started phone; nothing reads it now.
  */
-#define ZAP_MEMORY              0x8b71a000ull
+#define ZAP_MEMORY              (a640 ? 0x98f15000ull : 0x8b71a000ull)
 #define ZAP_MEMORY_SIZE         0x2000u
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_THREE_VALUES        3
@@ -2645,10 +2770,12 @@ step_zap_load(void)
 	if (!cx_ready() || !core_is_on) {
 		return false;
 	}
-	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
-	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
-	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
-	segment = image_file("fw", "a660_zap.b02", &size);
+	if (!a640) {
+		announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
+		printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
+		    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
+	}
+	segment = image_file("fw", a640 ? "a640_zap.b02" : "a660_zap.b02", &size);
 	if (segment == NULL || size == 0 || size > 0x1000) {
 		return false;
 	}
@@ -2722,11 +2849,17 @@ step_core_start(void)
 	put64(&gpu, "uche_write_range_max", UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
 	put64(&gpu, "uche_trap_base", UCHE_TRAP_BASE, 0x0001fffffffff000ull);
 	put64(&gpu, "uche_write_thru_base", UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
+	if (a640) {
+		put64(&gpu, "uche_gmem_range_min", GPU_WORD(0x0e0b), 0x100000);
+		put64(&gpu, "uche_gmem_range_max", GPU_WORD(0x0e0d), 0x1fffff);
+	}
 	put(&gpu, "uche_filter_cntl", UCHE_FILTER_CNTL, 0x804);
 	put(&gpu, "uche_cache_ways", UCHE_CACHE_WAYS, 0x4);
 	put(&gpu, "cp_roq_thresholds_2", CP_ROQ_THRESHOLDS_2, 0x02000140);
 	put(&gpu, "cp_roq_thresholds_1", CP_ROQ_THRESHOLDS_1, 0x8040362c);
-	put(&gpu, "cp_lpac_prog_fifo_size", CP_LPAC_PROG_FIFO_SIZE, 0x20);
+	if (!a640) {
+		put(&gpu, "cp_lpac_prog_fifo_size", CP_LPAC_PROG_FIFO_SIZE, 0x20);
+	}
 	put(&gpu, "cp_mem_pool_size", CP_MEM_POOL_SIZE, 128);
 	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, 0x00200200);
 	put(&gpu, "cp_ahb_cntl", CP_AHB_CNTL, 1);
@@ -2735,18 +2868,20 @@ step_core_start(void)
 	 * a6xx_calc_ubwc_config, a6xx_set_ubwc_config for this GPU: highest bank bit 14, and the
 	 * rest as below); Mesa is told the same (hakios_gpu_parameter()).
 	 */
-	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 1u << 11 | 1u << 4 | 1u << 1);
-	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), 1u << 1);
-	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 4 | 1u << 1);
-	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), 1u << 21);
-	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), 1);
+	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), a640 ? (1u << 4 | 2u << 1) : (1u << 11 | 1u << 4 | 1u << 1));
+	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), a640 ? 2u << 1 : 1u << 1);
+	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), a640 ? 2u << 1 : (2u << 4 | 1u << 1));
+	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), a640 ? 2u << 21 : 1u << 21);
+	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), a640 ? 0 : 1);
 	put(&gpu, "rbbm_perfctr_cntl", RBBM_PERFCTR_CNTL, 1);
-	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x1fffff);
-	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, 1u << 7 | 1);
+	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | (a640 ? 0xcfffff : 0x1fffff));
+	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, a640 ? 1 : (1u << 7 | 1));
 	put(&gpu, "cp_chicken_dbg", CP_CHICKEN_DBG, 1);
 	put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 0);
-	put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 1u << 6 | 1u << 5 | 1u << 3 | 1u << 2 | 1u << 1);
-	put(&gpu, "rb_dbg_eco_cntl", RB_DBG_ECO_CNTL, 0x04100000);     /* Mesa's value for this GPU */
+	if (!a640) {
+		put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 1u << 6 | 1u << 5 | 1u << 3 | 1u << 2 | 1u << 1);
+	}
+	put(&gpu, "rb_dbg_eco_cntl", RB_DBG_ECO_CNTL, a640 ? 0 : 0x04100000);     /* Mesa's value for this GPU */
 	/*
 	 * adreno_blind=1: the command processor is started with its microcode at an address where
 	 * nothing is. All it can do then is ask the SMMU for it, and the SMMU's record of the refusal
@@ -2759,7 +2894,9 @@ step_core_start(void)
 	get(&gpu, "cp_sqe_instr_base", CP_SQE_INSTR_BASE);
 	get(&gpu, "cp_rb_base", CP_RB_BASE);
 	get(&gpu, "cp_rb_cntl", CP_RB_CNTL);
-	get(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL);
+	if (!a640) {
+		get(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL);
+	}
 	get(&gpu, "rbbm_status", RBBM_STATUS);
 
 	announce(blind ? "start the 3D core's command processor with its microcode nowhere" :
@@ -2979,7 +3116,7 @@ stale_stop(void)
 	need(&rscc);
 	put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
 	gx_off();
-	if (rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == 0xeaaae5a0 && !(rd(rscc.base + RSCC_RSC_STATUS0_DRV0) & RSCC_ASLEEP)) {
+	if (rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == (a640 ? 0xa7a506a0u : 0xeaaae5a0u) && !(rd(rscc.base + RSCC_RSC_STATUS0_DRV0) & RSCC_ASLEEP)) {
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 1);
 		wait_for(&rscc, RSCC_RSC_STATUS0_DRV0, RSCC_ASLEEP, RSCC_ASLEEP, 100);
 		get(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0);
@@ -3075,7 +3212,7 @@ gpu_block_stop(void)
 		zap_is_loaded = false;
 	}
 	/* vendor's a6xx_rscc_sleep_sequence: the GMU's votes in RPMh are dropped, by the always-on sequencer */
-	if (rsc_awake && rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == 0xeaaae5a0) {
+	if (rsc_awake && rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == (a640 ? 0xa7a506a0u : 0xeaaae5a0u)) {
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 1);
 		if (!wait_for(&rscc, RSCC_RSC_STATUS0_DRV0, RSCC_ASLEEP, RSCC_ASLEEP, 100)) {
 			printf("adreno: %u: the GMU's RPMh channel does not go to sleep\n", step);
@@ -3165,7 +3302,7 @@ hakios_adreno_quiesce(void)
  * far it has got (a "fence": a submission's number, written by the core when it is through
  * with it). The caller holds one lock around all of these.
  */
-#define GPU_CHIP_ID             0x06030500ull   /* dt: qcom,chipid */
+#define GPU_CHIP_ID             (a640 ? 0x06040001ull : 0x06030500ull)   /* dt: qcom,chipid */
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
 #define GPU_ADDRESSES_SIZE      0xe0000000ull
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
@@ -3255,15 +3392,17 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 {
 	switch (which) {
 	case 0x01:                              /* GPU_ID: none, the chip ID says it */
-	case 0x06:                              /* GMEM_BASE */
 	case 0x08:                              /* PP_PGTABLE */
 	case 0x09:                              /* FAULTS */
 	case 0x0a:                              /* SUSPENDS */
 	case 0x11:                              /* RAYTRACING */
 		*value = 0;
 		return true;
+	case 0x06:                              /* GMEM_BASE: must match UCHE_GMEM_RANGE */
+		*value = a640 ? 0x100000 : 0;
+		return true;
 	case 0x02:                              /* GMEM_SIZE */
-		*value = 512 * 1024;
+		*value = a640 ? 1024 * 1024 : 512 * 1024;
 		return true;
 	case 0x03:                              /* CHIP_ID, with the speed bin above it */
 		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
@@ -3278,13 +3417,13 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 1;
 		return true;
 	case 0x10:                              /* HIGHEST_BANK_BIT */
-		*value = 14;
+		*value = a640 ? 15 : 14;
 		return true;
 	case 0x12:                              /* UBWC_SWIZZLE */
 		*value = 6;
 		return true;
 	case 0x13:                              /* MACROTILE_MODE */
-		*value = 1;
+		*value = a640 ? 0 : 1;
 		return true;
 	default:                                /* among them VA_START, VA_SIZE: addresses are ours to give */
 		return false;
@@ -3532,12 +3671,13 @@ static bool(*const steps[])(void) = {
  * The SoC's temperature sensors report by themselves, in a block that is always on (dt: tsens1,
  * whose readings are at 0xc265000; Linux's tsens-v2.c): a status word a sensor, the last reading
  * in its low 12 bits, signed, in tenths of a degree, and bit 21 when there is one. Sensors 1 and
- * 2 sit at the GPU (dt: gpuss-0, gpuss-1). Read, never written: once a minute while the GPU is
+ * 2 sit at the redwood GPU; raphael uses TSENS0/15 and TSENS1/11. Read, never written: once a minute while the GPU is
  * kept, for the line beside the kernel's line about memory (osfmk/arm64/loader_return.c). A
  * sensor caught between two readings has none for a moment and is asked again; one that still
  * has none is put down as -273.0.
  */
 static struct block tsens = { "tsens1", 0x0c265000, 0x200 };
+static struct block tsens0 = { "tsens0", 0x0c263000, 0x200 };
 #define TSENS_STATUS(sensor)    (0xa0 + 4 * (sensor))
 #define TSENS_VALID             (1u << 21)
 
@@ -3550,10 +3690,15 @@ hakios_adreno_minute(void)
 		return;
 	}
 	need(&tsens);
+	if (a640) {
+		need(&tsens0);
+	}
 	for (unsigned i = 0; i < 2; i++) {
+		vm_offset_t base = a640 && i == 0 ? tsens0.base : tsens.base;
+		unsigned sensor = a640 ? (i == 0 ? 15 : 11) : 1 + i;
 		tenths[i] = -2730;
 		for (unsigned again = 0; again < 16 && tenths[i] == -2730; again++) {
-			uint32_t status = rd(tsens.base + TSENS_STATUS(1 + i));
+			uint32_t status = rd(base + TSENS_STATUS(sensor));
 
 			if (status & TSENS_VALID) {
 				tenths[i] = (int32_t)(status << 20) >> 20;
@@ -3604,11 +3749,197 @@ static struct block disp_intf = { "intf1", 0x0ae36000, 0x300 };         /* dt: m
 #define INTF_FRAME_COUNT        0x0ac
 #define INTF_LINE_COUNT         0x0b0
 
+/* SM8150 scanout: compose into reserved off-screen memory, then latch VIG0 at TE. */
+static vm_offset_t raphael_mdp, raphael_te, raphael_irq, raphael_fb[3];
+static vm_offset_t raphael_dispcc;
+static uint32_t raphael_front, raphael_back = 1, raphael_fb_size;
+static bool raphael_flipping;
+extern uint64_t loader_framebuffer;
+extern void loader_set_framebuffer(uint64_t phys);
+
+int raphael_display_init(uint32_t width, uint32_t height, uint32_t stride);
+void *raphael_display_back(bool preserve);
+bool raphael_display_present(void);
+void raphael_display_quiesce(void);
+int raphael_display_scan_counter(uint32_t *line);
+
+int
+raphael_display_init(uint32_t width, uint32_t height, uint32_t stride)
+{
+	static const uint32_t interfaces[] = { 0x6b800, 0x6c000 };
+	vm_offset_t clock;
+
+	if (!hakios_is_raphael() || width != 1080 || height != 2340 || stride != 4320) {
+		return 0;
+	}
+	need(&gcc);
+	wr(gcc.base + 0xb00c, rd(gcc.base + 0xb00c) | 1);
+	clock = raphael_dispcc = ml_io_map(0x0af00000, 0x10000);
+	wr(clock + 0x2080, rd(clock + 0x2080) | 1);
+	sleep_ms(1);
+	if (!(rd(gcc.base + 0xb00c) & 1) || (rd(clock + 0x2080) & CBCR_OFF)) {
+		return 0;
+	}
+	raphael_mdp = ml_io_map(0x0ae00000, 0x85000);
+	if (rd(raphael_mdp + 0x5014) != 0x9c000000 || rd(raphael_mdp + 0x5024) != stride ||
+	    rd(raphael_mdp + 0x5000) != (height << 16 | width)) {
+		printf("raphael-display: unexpected firmware scanout, no flip\n");
+		return 0;
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		vm_offset_t p = raphael_mdp + interfaces[i];
+		printf("raphael-display: INTF%u TE %#x height %#x count %#x auto %#x frame %#x\n", i + 1,
+		    rd(p + 0x284), rd(p + 0x28c), rd(p + 0x298), rd(p + 0x2b4), rd(p + 0xac));
+		if (rd(p + 0x284) & 1) {
+			raphael_te = p;
+			raphael_irq = raphael_mdp + 0x6e800 + i * 0x100;
+		}
+	}
+	if (raphael_te == 0) {
+		printf("raphael-display: no active interface tear-check, no flip\n");
+		return 0;
+	}
+	raphael_fb_size = stride * height;
+	for (unsigned i = 0; i < 3; i++) {
+		/* Permanent I/O mappings share an 8 MiB submap; a single frame exceeds it. */
+		raphael_fb[i] = ml_io_map_unmappable(0x9c000000ull + i * 0xa00000ull,
+		    raphael_fb_size, VM_WIMG_WCOMB);
+		if (raphael_fb[i] == 0) {
+			return 0;
+		}
+	}
+	raphael_flipping = true;
+	loader_set_framebuffer(0x9c000000);
+	printf("raphael-display: three scanout buffers, VIG0/CTL0, hardware TE\n");
+	return 1;
+}
+
+void *
+raphael_display_back(bool preserve)
+{
+	if (!raphael_flipping) {
+		return NULL;
+	}
+	/* Preserve layers outside a partial swap without ever changing the scanned buffer. */
+	if (preserve) {
+		memcpy((void *)raphael_fb[raphael_back], (const void *)raphael_fb[raphael_front], raphael_fb_size);
+	}
+	return (void *)raphael_fb[raphael_back];
+}
+
+/* Read the TE phase without consuming the interrupt used to confirm page flips. */
+int
+raphael_display_scan_counter(uint32_t *line)
+{
+	if (!raphael_flipping || !(rd(gcc.base + 0xb00c) & 1) ||
+	    (rd(raphael_dispcc + 0x2080) & CBCR_OFF)) {
+		return 0;
+	}
+	uint32_t config = rd(raphael_te + 0x288);
+	if (!(rd(raphael_te + 0x284) & 1) || (config & (3u << 19)) != (3u << 19)) {
+		return 0;
+	}
+	/* DPU INTF_TEAR_INT_COUNT_VAL: low 16 bits are the read pointer; external TE resets it to INIT. */
+	*line = (rd(raphael_te + 0x298) - rd(raphael_te + 0x294)) & 0xffff;
+	return 1;
+}
+
+bool
+raphael_display_present(void)
+{
+	uint64_t began = mach_absolute_time(), ns;
+
+	/* The firmware's 0xffff TE height leaves its frame counter at zero. */
+	wr(raphael_irq + 8, 1u << 3);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	wr(raphael_mdp + 0x5014, 0x9c000000 + raphael_back * 0xa00000);
+	wr(raphael_mdp + 0x2018, 1); /* VIG0 flush bit, sde_hw_ctl.c:sspp_tbl. */
+	/* Linux also omits CTL_START while INTF autorefresh owns the kickoffs. */
+	if (!(rd(raphael_te + 0x2b4) & (1u << 31))) {
+		wr(raphael_mdp + 0x201c, 1);
+	}
+	for (;;) {
+		if ((rd(raphael_irq + 4) & (1u << 3)) && !(rd(raphael_mdp + 0x2018) & 1)) {
+			break;
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+		if (ns >= 50 * NSEC_PER_MSEC) {
+			printf("raphael-display: timeout count %#x flush %#x start %#x TE IRQ %#x/%#x output %#x line %#x\n",
+			    rd(raphael_te + 0x298), rd(raphael_mdp + 0x2018), rd(raphael_mdp + 0x201c),
+			    rd(raphael_mdp + 0x6e804), rd(raphael_mdp + 0x6e904),
+			    rd(raphael_te + 0x2ac), rd(raphael_te + 0x2b0));
+			printf("raphael-display: flip did not latch at TE, restoring boot framebuffer\n");
+			raphael_display_quiesce();
+			return false;
+		}
+		delay_for_interval(100, NSEC_PER_USEC);
+	}
+	raphael_front = raphael_back;
+	raphael_back = (raphael_back + 1) % 3;
+	loader_set_framebuffer(0x9c000000ull + raphael_front * 0xa00000ull);
+	static unsigned frames;
+	if (frames++ < 3) {
+		printf("raphael-display: flip %u latched, front %#llx flush %#x\n", frames,
+		    (unsigned long long)loader_framebuffer, rd(raphael_mdp + 0x2018));
+	}
+	return true;
+}
+
+void
+raphael_display_quiesce(void)
+{
+	if (!raphael_flipping) {
+		return;
+	}
+	if (raphael_front != 0) {
+		memcpy((void *)raphael_fb[0], (const void *)raphael_fb[raphael_front], raphael_fb_size);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	wr(raphael_mdp + 0x5014, 0x9c000000);
+	wr(raphael_mdp + 0x2018, 1);
+	if (!(rd(raphael_te + 0x2b4) & (1u << 31))) {
+		wr(raphael_mdp + 0x201c, 1);
+	}
+	loader_set_framebuffer(0x9c000000);
+	raphael_flipping = false;
+}
+
 static void
 display_probe(void)
 {
 	uint32_t saved_fine = fine, line, frame, shown, counting, frames[2], lines[2], bus;
 	uint64_t times[2];
+	if (a640) {
+		static const uint32_t pipes[] = { 0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000 };
+		vm_offset_t clock = ml_io_map(0x0af00000, 0x10000), mdp;
+
+		need(&gcc);
+		wr(gcc.base + 0xb00c, rd(gcc.base + 0xb00c) | 1);
+		wr(clock + 0x2080, rd(clock + 0x2080) | 1);
+		sleep_ms(10);
+		if (!(rd(gcc.base + 0xb00c) & 1) || (rd(clock + 0x2080) & (1u << 31))) {
+			printf("raphael-display: register clocks unavailable\n");
+			return;
+		}
+		mdp = ml_io_map(0x0ae00000, 0x85000);
+		for (unsigned i = 0; i < 8; i++) {
+			vm_offset_t p = mdp + pipes[i];
+			printf("raphael-display: SSPP%u offset %#x size %#x addr %#x/%#x stride %#x format %#x op %#x\n", i,
+			    pipes[i], rd(p), rd(p + 0x14), rd(p + 0x18), rd(p + 0x24), rd(p + 0x30), rd(p + 0x38));
+		}
+		for (unsigned i = 0; i < 6; i++) {
+			vm_offset_t c = mdp + 0x2000 + 0x200 * i;
+			printf("raphael-display: CTL%u flush %#x start %#x top %#x layer0 %#x\n", i, rd(c + 0x18),
+			    rd(c + 0x1c), rd(c + 0x14), rd(c));
+		}
+		for (unsigned i = 0; i < 3; i++) {
+			vm_offset_t p = mdp + 0x71000;
+			printf("raphael-display: PP0 TE %#x height %#x init %#x rd_count %#x wr_count %#x auto %#x\n",
+			    rd(p), rd(p + 8), rd(p + 0x10), rd(p + 0x14), rd(p + 0x2c), rd(p + 0x30));
+			sleep_ms(10);
+		}
+		return;
+	}
 
 	step = newest_step = 0;
 	fine = 1;
@@ -3716,7 +4047,9 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 static bool
 start_by_itself(void)
 {
-	static const char *const files[] = { "a660_gmu.bin", "a660_sqe.fw", "a660_zap.mdt", "a660_zap.b02" };
+	const char *const files[] = { a640 ? "a640_gmu.bin" : "a660_gmu.bin",
+		a640 ? "a630_sqe.fw" : "a660_sqe.fw", a640 ? "a640_zap.mdt" : "a660_zap.mdt",
+		a640 ? "a640_zap.b02" : "a660_zap.b02" };
 	const char *missing = NULL;
 	uint64_t size;
 
@@ -3756,6 +4089,18 @@ hakios_adreno_init(void)
 	uint32_t only = 0, done = 0, failed = 0, keep = 0;
 	bool by_itself = false;
 
+	a640 = hakios_is_raphael();
+	if (a640) {
+		gpu.phys = 0x02c00000;
+		gpucc.phys = 0x02c90000;
+		gmu.phys = 0x02c6a000;
+		gmu.size = 0x30000;
+		gbif.phys = 0x02c0f000;
+		cx_misc.phys = 0x02c9e000;
+		rscc.phys = 0x02c8d000;
+		smmu.phys = 0x02ca0000;
+		smmu.size = 0x10000;
+	}
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();
 	}

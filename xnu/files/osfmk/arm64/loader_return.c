@@ -60,6 +60,7 @@ extern void hakios_camera_quiesce(void);
 extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
 extern void hakios_var_save_on_return(void);   /* bsd/dev/hakios.ufs.c: the data volume into the flash */
+extern void raphael_display_quiesce(void);
 extern void raphael_touch_quiesce(void);
 void loader_checkpoint(uint64_t n);
 
@@ -201,6 +202,8 @@ struct loader_live {
 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
 	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
+	uint64_t magic3;
+	const uint64_t *framebuffer;
 };
 
 /*
@@ -210,12 +213,21 @@ struct loader_live {
 uint64_t loader_recording[3];
 /* ... and of the sound (/dev/hakios-audio makes one with boot-arg rec_sound). */
 uint64_t loader_sound[3];
+uint64_t loader_framebuffer;
+
+void
+loader_set_framebuffer(uint64_t phys)
+{
+	loader_framebuffer = phys;
+	__asm__ volatile ("dc cvac, %0\n dsb sy" : : "r" (&loader_framebuffer) : "memory");
+}
 
 struct loader_live loader_live = {
 	.magic = 0x214556494c554e58ULL, .log = loader_log, .log_len = &loader_log_len, .log_ring_at = &loader_log_ring_at,
 	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
+	.magic3 = 0x334556494c554e58ULL, .framebuffer = &loader_framebuffer,
 };
 
 /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
@@ -373,6 +385,7 @@ loader_return(void)
 	psci_smp_stop_others();
 #endif
 	raphael_touch_quiesce();
+	raphael_display_quiesce();
 	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */

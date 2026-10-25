@@ -1,0 +1,7 @@
+# One RAM session: CPU count/parallelism, GPU renderer/readback, then manual iOS input.
+/redwood/bin/hello_dyn raphael combined hardware test
+/redwood/bin/cpu_test
+/redwood/bin/cpu_test 45 &
+/redwood/bin/rwtouch wait 20
+/redwood/bin/gl_test 8 1080 2340
+/bin/ps -A

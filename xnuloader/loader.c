@@ -869,6 +869,7 @@ struct kernel_live {
 	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
 	uint64_t magic2;                /* "XNULIVE2": the kernel is new enough to have what follows */
 	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
+	uint64_t magic3, framebuffer;   /* current scanout PA, through a kernel virtual pointer */
 };
 
 /*
@@ -3701,7 +3702,20 @@ fb_command(char *cmd)
 				fb_reply("FAIL", "no display");
 				return;
 			}
-			staged_data = (const char *)(uintptr_t)SCREEN.base;
+			uint64_t base = SCREEN.base;
+			if (busy && running_live != NULL && running_live->magic3 == 0x334556494c554e58ULL &&
+			    running_live->framebuffer != 0) {
+				uint64_t at = running_live->framebuffer + running_slide;
+				flush_dcache(at, at + 8);
+				uint64_t front = *(const volatile uint64_t *)(uintptr_t)at;
+				/* Only the raphael display reservation is used for page flipping. */
+				uint64_t bytes = (uint64_t)SCREEN.stride * SCREEN.height;
+				if (PLAT == &platform_raphael && bytes <= 0x02400000 && front >= 0x9c000000 &&
+				    front <= 0x9e400000 - bytes) {
+					base = front;
+				}
+			}
+			staged_data = (const char *)(uintptr_t)base;
 			staged_len = (uint64_t)SCREEN.stride * SCREEN.height;
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem recording")) {
@@ -3949,6 +3963,18 @@ efi_main(efi_handle image, efi_system_table *st)
 	persist_logs = PLAT == &platform_redwood;
 
 	install_exception_hook();
+	if (PLAT == &platform_raphael) {
+		/* Retain ABL's command-mode pipeline and refresh it once per tear-check frame. */
+		volatile uint32_t *pp = (volatile uint32_t *)0x0ae71000ULL;
+		volatile uint32_t *ctl = (volatile uint32_t *)0x0ae02000ULL;
+		if (pp[0] & 1u) {
+			pp[0x30 / 4] = (1u << 31) | 1u;
+			__asm__ volatile ("dsb sy" ::: "memory");
+			ctl[0x1c / 4] = 1;
+			__asm__ volatile ("dsb sy" ::: "memory");
+			print("display: raphael command-mode autorefresh enabled\n");
+		}
+	}
 	wdt_arm();
 
 	int have_payload = parse_payload(&pi, 0);

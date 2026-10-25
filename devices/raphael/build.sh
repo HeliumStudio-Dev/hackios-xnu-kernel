@@ -12,7 +12,7 @@ kernel)
 loader) ./xnuloader/build.sh ;;
 images)
     GL=1 REST=1 QUIET=1 OSLOG= RC="$ROOT/userland/rc.launchd" \
-    RC_JOBS="$ROOT/userland/rc.jobs" userland/build.sh
+    RC_JOBS="$ROOT/devices/raphael/raphael.jobs" userland/build.sh
     ;;
 boot)
     mkdir -p out/raphael
