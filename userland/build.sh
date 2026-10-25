@@ -498,6 +498,16 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	rm -rf flashboot flashboot.os
 	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS flashboot/Cryptexes/App
 	cp obj/stage0 flashboot/sbin/launchd
+	# These device-private inputs stay in the resident RAM image; never in shared images.
+	if [ -n "${MPSS_FW:-}" ]; then
+		[ -z "$SHARE" ] || { echo "MPSS_FW is device-private; SHARE is refused" >&2; exit 1; }
+		for f in modem.mdt wlanmdsp.mbn nv-modemst1 nv-modemst2 nv-fsg nv-fsc firmware-5.bin; do
+			[ -f "$MPSS_FW/$f" ] || { echo "Missing MPSS_FW/$f" >&2; exit 1; }
+		done
+		mkdir -p flashboot/fw
+		cp -a "$MPSS_FW"/. flashboot/fw/
+		chmod 0600 flashboot/fw/nv-*
+	fi
 	# the OS cryptex, and the shared cache in it, only where this image will carry it:
 	# with CRYPTEXES=flash the cryptexes are read from the phone's flash and this tree is
 	# built and thrown away unused. The guard ends with the cache: everything after it goes

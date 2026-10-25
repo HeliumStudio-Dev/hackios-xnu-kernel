@@ -42,7 +42,7 @@ struct hakios_sta_scan {
 	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
 };
 
-enum { HAKIOS_STA_OPEN, HAKIOS_STA_WPA2_PSK };
+enum { HAKIOS_STA_OPEN, HAKIOS_STA_WPA2_PSK, HAKIOS_STA_WPA3_SAE };
 
 struct hakios_sta_join {
 	uint8_t ssid[32], ssid_length;

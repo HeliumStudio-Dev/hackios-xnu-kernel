@@ -1,0 +1,67 @@
+--- a/ath10k/mac.c
++++ b/ath10k/mac.c
+@@ -9869,6 +9869,7 @@
+ #define WRD_METHOD "WRDD"
+ #define WRDD_WIFI  (0x07)
+ 
++#if IS_ENABLED(CONFIG_ACPI)
+ static u32 ath10k_mac_wrdd_get_mcc(struct ath10k *ar, union acpi_object *wrdd)
+ {
+ 	union acpi_object *mcc_pkg;
+@@ -9951,6 +9952,13 @@
+ 	*rd |= COUNTRY_ERD_FLAG;
+ 	return 0;
+ }
++
++#else
++static int ath10k_mac_get_wrdd_regulatory(struct ath10k *ar, u16 *rd)
++{
++	return -EOPNOTSUPP;
++}
++#endif
+ 
+ static int ath10k_mac_init_rd(struct ath10k *ar)
+ {
+--- a/ath10k/qmi.c
++++ b/ath10k/qmi.c
+@@ -815,6 +815,7 @@
+ 		return;
+ 
+ 	if (qmi->fw_ready) {
++		if (ath10k_qmi_cap_send_sync_msg(qmi)) return;
+ 		ath10k_snoc_fw_indication(ar, ATH10K_QMI_EVENT_FW_READY_IND);
+ 		return;
+ 	}
+--- a/ath10k/snoc.c
++++ b/ath10k/snoc.c
+@@ -1608,6 +1608,21 @@
+ 	return 0;
+ }
+ 
++#ifdef __FreeBSD__
++/* SM8150 has no wifi-firmware child; TrustZone owns firmware memory. */
++static int ath10k_fw_init(struct ath10k *ar)
++{
++ struct ath10k_snoc *snoc = ath10k_snoc_priv(ar);
++ struct device_node *child = of_get_child_by_name(ar->dev->of_node, "wifi-firmware");
++ if (child) { of_node_put(child); return -EOPNOTSUPP; }
++ snoc->use_tz = true;
++ return 0;
++}
++static int ath10k_fw_deinit(struct ath10k *ar)
++{
++ return ath10k_snoc_priv(ar)->use_tz ? 0 : -EOPNOTSUPP;
++}
++#else
+ static int ath10k_fw_init(struct ath10k *ar)
+ {
+ 	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
+@@ -1712,6 +1727,8 @@
+ 
+ 	return 0;
+ }
++
++#endif
+ 
+ static const struct of_device_id ath10k_snoc_dt_match[] = {
+ 	{ .compatible = "qcom,wcn3990-wifi",

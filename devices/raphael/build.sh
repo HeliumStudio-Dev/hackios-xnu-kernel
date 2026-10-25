@@ -7,7 +7,8 @@ source devices/raphael/device.conf
 export UEFI_TARGET UEFI_FD DTB FD_BASE FD_SIZE PAYLOAD_BASE
 case ${1:-kernel} in
 kernel)
-    ./xnu-build.sh -j"${JOBS:-8}"
+    python3 tools/mk-ath10k.py
+    WIFI_OBJECT="$ROOT/xnu-deps/build/ath10k/out/ath10k.o" ./xnu-build.sh -j"${JOBS:-8}"
     ;;
 loader) ./xnuloader/build.sh ;;
 images)

@@ -4,7 +4,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/xnu-env.sh"
 cd "$XNU_SRC" || exit 1
 # The Wi-Fi driver's object (tools/mk-ath11k.sh) is linked into the kernel when it is there; make
 # does not see it change, so the linked kernel is thrown away when it has.
-LX=$XNUDEPS/build/ath11k/out/ath11k.o
+LX=${WIFI_OBJECT:-$XNUDEPS/build/ath11k/out/ath11k.o}
 STAMP=BUILD/obj/hakios-objects
 mtime() { if [ "$XNU_HOST_OS" = Darwin ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi; }
 if [ -f "$LX" ]; then now="$LX $(mtime "$LX")"; else LX= now=; fi

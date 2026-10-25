@@ -34,6 +34,9 @@
 #include <lx_os.h>
 #include "lx.h"
 #include "lx_wpa.h"
+#ifdef LX_HAVE_SAE
+#include "sae.h"
+#endif
 
 int linuxkpi_debug_80211;			/* (which of the headers' own remarks are printed: none) */
 
@@ -102,7 +105,11 @@ struct lx_radio {
 	uint16_t answer_status, aid;
 	unsigned answer_length;
 	uint8_t answer_elements[ELEMENTS_MOST];	/* of the association response */
-	uint8_t rsn[24];			/* our RSN element, as the association request has it */
+	uint8_t rsn[64];			/* our RSN and optional RSNXE elements */
+	unsigned rsn_length;
+	bool sae, h2e;
+	uint8_t pmkid[16], auth_frame[1024];
+	unsigned auth_length;
 	struct lx_wpa wpa;
 	volatile int handshake;			/* the last thing lx_wpa_message() said */
 	const char *handshake_why;
@@ -707,6 +714,10 @@ static void
 frame_send(struct lx_radio *radio, struct sk_buff *skb)
 {
 	struct ieee80211_tx_control control = { .sta = radio->sta };
+	if (radio->sae && radio->pairwise_key && ieee80211_is_robust_mgmt_frame(skb)) {
+		skb->data[1] |= 0x40;
+		IEEE80211_SKB_CB(skb)->control.hw_key = radio->pairwise_key;
+	}
 
 	radio->ops->tx(&radio->hw, &control, skb);
 }
@@ -827,16 +838,24 @@ ethernet_received(struct lx_radio *radio, struct sk_buff *skb)
 
 /* A management frame from the access point of the network being joined. */
 static void
-management_received(struct lx_radio *radio, const uint8_t *f, unsigned length)
+management_received(struct lx_radio *radio, const uint8_t *f, unsigned length, const struct sk_buff *skb)
 {
 	int answer = ANSWER_NONE;
 	unsigned status = 0;
 
 	if (radio->sta == NULL || length < 26 || memcmp(f + 10, radio->target.address, ETH_ALEN) != 0 ||
-	    memcmp(f + 4, radio->vif->addr, ETH_ALEN) != 0) {
+	    (memcmp(f + 4, radio->vif->addr, ETH_ALEN) != 0 && !(radio->sae && (f[4] & 1)))) {
 		return;
 	}
+	if (radio->sae && ieee80211_is_robust_mgmt_frame(skb) &&
+	    lx_wpa_mgmt(&radio->wpa, f, length, !!(IEEE80211_SKB_RXCB(skb)->flag & RX_FLAG_DECRYPTED))) return;
 	if (f[0] == 0xb0 && length >= 30) {		/* authentication: algorithm, step (2: the answer), status */
+		if (radio->sae) {
+			if (f[24] != 3 || f[25] || length - 26 > sizeof(radio->auth_frame)) return;
+			lx_os_lock();
+			memcpy(radio->auth_frame, f + 26, length - 26); radio->auth_length = length - 26;
+			lx_os_wakeup(&radio->auth_length); lx_os_unlock(); return;
+		}
 		status = f[28] | f[29] << 8;
 		answer = (f[26] | f[27] << 8) != 2 ? ANSWER_NONE : status == 0 ? ANSWER_AUTHENTICATED : ANSWER_REFUSED;
 	} else if (f[0] == 0x10 && length >= 30) {	/* association response: capabilities, status, our number, elements */
@@ -847,6 +866,13 @@ management_received(struct lx_radio *radio, const uint8_t *f, unsigned length)
 		radio->answer_length = length - 30 < ELEMENTS_MOST ? length - 30 : ELEMENTS_MOST;
 		memcpy(radio->answer_elements, f + 30, radio->answer_length);
 		lx_os_unlock();
+	} else if (radio->sae && f[0] == 0xd0 && length >= 28 && f[24] == 8 && f[25] == 0 && radio->pairwise_key) {
+		struct sk_buff *reply; uint8_t *body;
+		if ((reply = frame_new(radio, 28, &body)) != NULL) {
+			body = management(radio, body, 0xd0); body[0] = 8; body[1] = 1;
+			memcpy(body + 2, f + 26, 2); frame_send(radio, reply);
+		}
+		return;
 	} else if (f[0] == 0xd0 && length >= 28 && f[24] == 3 && radio->reached >= IEEE80211_STA_ASSOC && lx_os_option("wifi_ba")) {
 		/* an action frame, block ack's: ADDBA request (0) or DELBA (2); done on the driver's terms in ba_handle() */
 		unsigned tid;
@@ -909,7 +935,7 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 		heard(radio, skb->data, skb->len, status->freq, status->signal);
 	} else if (skb->len >= 24 && (skb->data[0] & 0x0c) == 0x00) {
 		radio->others++;
-		management_received(radio, skb->data, skb->len);
+		management_received(radio, skb->data, skb->len, skb);
 	} else if (to_ethernet(skb, (status->flag & RX_FLAG_IV_STRIPPED) != 0)) {
 		ethernet_received(radio, skb);
 	} else {
@@ -1180,6 +1206,72 @@ answer_wait(struct lx_radio *radio, unsigned ms)
 	return (answer);
 }
 
+#ifdef LX_HAVE_SAE
+static unsigned
+sae_wait(struct lx_radio *radio, uint8_t bytes[1024])
+{
+	uint64_t began = lx_os_nanoseconds(); unsigned n;
+	lx_os_lock();
+	while (!radio->auth_length && lx_os_nanoseconds() - began < 1000000000ull)
+		lx_os_sleep(&radio->auth_length, 20 * 1000000ull);
+	n = radio->auth_length;
+	if (n) memcpy(bytes, radio->auth_frame, n);
+	radio->auth_length = 0; lx_os_unlock(); return n;
+}
+
+static bool
+sae_send(struct lx_radio *radio, unsigned sequence, unsigned status, const uint8_t *bytes, unsigned n)
+{
+	uint8_t *body; struct sk_buff *skb = frame_new(radio, 30 + n, &body);
+	if (!skb) return false;
+	body = management(radio, body, 0xb0);
+	body[0] = 3; body[1] = 0; body[2] = sequence; body[3] = 0; body[4] = status; body[5] = 0;
+	memcpy(body + 6, bytes, n); frame_send(radio, skb); return true;
+}
+
+static int
+sae_authenticate(struct lx_radio *radio, const struct hakios_sta_join *what)
+{
+	struct lx_sae *s = lx_sae_new(radio->vif->addr, radio->target.address, what->ssid, what->ssid_length,
+	    what->passphrase, what->passphrase_length, radio->h2e);
+	if (!s) return ENOMEM;
+	uint8_t bytes[1024], received[1024], token[255]; unsigned token_len = 0;
+	int error = ETIMEDOUT; bool committed = false;
+	lx_os_lock(); radio->auth_length = 0; lx_os_unlock();
+	for (unsigned attempt = 0; attempt < 5; attempt++) {
+		unsigned n = sizeof(bytes);
+		if (lx_sae_commit(s, token, token_len, bytes, &n) || !sae_send(radio, 1, radio->h2e ? 126 : 0, bytes, n)) { error = EIO; break; }
+		n = sae_wait(radio, received);
+		if (n < 4) continue;
+		unsigned sequence = received[0] | received[1] << 8, status = received[2] | received[3] << 8;
+		printf("lx: SAE commit response sequence %u status %u, %u bytes\n", sequence, status, n - 4);
+		if (sequence != 1) continue;
+		if (status == 76 && n >= 6 && received[4] == 19 && !received[5]) {
+			const uint8_t *t = received + 6; unsigned have = n - 6;
+			if (radio->h2e) {
+				if (have < 3 || t[0] != 255 || t[1] < 1 || t[1] > have - 2 || t[2] != 93) { error = EAUTH; break; }
+				have = t[1] - 1; t += 3;
+			}
+			if (!have || have > sizeof(token)) { error = EAUTH; break; }
+			memcpy(token, t, have); token_len = have; continue;
+		}
+		if (status != (radio->h2e ? 126u : 0u) || lx_sae_accept_commit(s, received + 4, n - 4)) { error = EAUTH; break; }
+		committed = true; break;
+	}
+	for (unsigned attempt = 0; committed && attempt < 3; attempt++) {
+		unsigned n = sizeof(bytes);
+		if (lx_sae_confirm(s, bytes, &n) || !sae_send(radio, 2, 0, bytes, n)) { error = EIO; break; }
+		n = sae_wait(radio, received);
+		if (n < 4 || received[0] != 2 || received[1]) continue;
+		error = received[2] || received[3] || lx_sae_accept_confirm(s, received + 4, n - 4, radio->wpa.pmk, radio->pmkid) ? EAUTH : 0;
+		break;
+	}
+	lx_sae_delete(s); explicit_bzero(bytes, sizeof(bytes)); explicit_bzero(token, sizeof(token));
+	lx_tell("lx: SAE group 19 %s authentication: %d\n", radio->h2e ? "H2E" : "H&P", error);
+	return error;
+}
+#endif
+
 /* The rates among `count` bytes of a rates element that the band has, as bits in the band's own order; and the "basic" ones. */
 static uint32_t
 rates_of(const struct ieee80211_supported_band *band, const uint8_t *rates, unsigned count, uint32_t *basic)
@@ -1293,8 +1385,18 @@ request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
 	radio->rsn[1] = 20;
 	memcpy(radio->rsn + 2, "\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x02\x00\x00", 20);
 	radio->rsn[7] = (uint8_t)group_cipher;
-	memcpy(at, radio->rsn, 22);
-	at += 22;
+	radio->rsn_length = 22;
+	if (radio->sae) {
+		radio->rsn[1] = 42; radio->rsn[19] = 8; radio->rsn[20] = 0xc0;
+		radio->rsn[22] = 1; radio->rsn[23] = 0;
+		memcpy(radio->rsn + 24, radio->pmkid, 16);
+		memcpy(radio->rsn + 40, "\x00\x0f\xac\x06", 4);
+		radio->rsn_length = 44;
+		if (radio->h2e) { memcpy(radio->rsn + 44, "\xf4\x01\x20", 3); radio->rsn_length += 3; }
+	}
+	memcpy(at, radio->rsn, radio->rsn_length);
+	at += radio->rsn_length;
+	radio->wpa.rsn_length = radio->rsn_length;
 	if (element(target->elements, target->elements_length, 45) != NULL && band->ht_cap.ht_supported) {
 		uint16_t cap = (uint16_t)(band->ht_cap.cap & (radio->width > 20 ? 0xffff : ~(IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
 		    IEEE80211_HT_CAP_SGI_40)));
@@ -1332,11 +1434,12 @@ request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
  * *group_cipher is then what it ciphers frames to everybody with; else what stands in the way.
  */
 static const char *
-protection(const struct lx_target *target, unsigned *group_cipher)
+protection(const struct lx_target *target, unsigned *group_cipher, bool *sae, bool *h2e)
 {
 	const uint8_t *rsn = element(target->elements, target->elements_length, 48), *at, *end;
-	bool ccmp = false, passphrase = false;
+	bool ccmp = false, passphrase = false, offers_sae = false;
 	unsigned count;
+	*sae = *h2e = false;
 
 	if (rsn == NULL) {
 		return (target->capability & 0x10 ? "it is protected by something older than WPA2" : "it is not protected at all: an "
@@ -1344,12 +1447,13 @@ protection(const struct lx_target *target, unsigned *group_cipher)
 	}
 	at = rsn + 2;
 	end = at + rsn[1];
-	if (end - at < 8 || at[2] != 0x00 || at[3] != 0x0f || at[4] != 0xac) {
+	if (end - at < 8 || at[0] != 1 || at[1] || at[2] != 0x00 || at[3] != 0x0f || at[4] != 0xac) {
 		return ("its RSN element is not one this reads");
 	}
 	*group_cipher = at[5];
 	count = at[6] | at[7] << 8;
 	at += 8;
+	if (!count || count > (unsigned)(end - at) / 4) return "invalid pairwise cipher list";
 	for (; count != 0 && end - at >= 4; count--, at += 4) {
 		ccmp |= at[0] == 0x00 && at[1] == 0x0f && at[2] == 0xac && at[3] == 4;
 	}
@@ -1358,14 +1462,34 @@ protection(const struct lx_target *target, unsigned *group_cipher)
 	}
 	count = at[0] | at[1] << 8;
 	at += 2;
+	if (!count || count > (unsigned)(end - at) / 4) return "invalid AKM list";
 	for (; count != 0 && end - at >= 4; count--, at += 4) {
 		passphrase |= at[0] == 0x00 && at[1] == 0x0f && at[2] == 0xac && at[3] == 2;
+		offers_sae |= at[0] == 0x00 && at[1] == 0x0f && at[2] == 0xac && at[3] == 8;
 	}
 	if (*group_cipher != 4) {
 		return ("it ciphers frames to everybody with something other than CCMP (TKIP, for old stations), which is not done here");
 	}
 	if (!ccmp) {
 		return ("it does not offer CCMP");
+	}
+	if (offers_sae) {
+#ifdef LX_HAVE_SAE
+		if (end - at < 2 || !(at[0] & 0x80)) return "SAE requires management frame protection";
+		at += 2;
+		if (end - at == 1) return "truncated PMKID count";
+		if (end - at >= 2) {
+			count = at[0] | at[1] << 8; at += 2;
+			if (count > (unsigned)(end - at) / 16) return "invalid PMKID list";
+			at += 16 * count;
+			if (end - at && (end - at != 4 || memcmp(at, "\x00\x0f\xac\x06", 4))) return "unsupported group management cipher";
+		}
+		const uint8_t *rsnx = element(target->elements, target->elements_length, 244);
+		*sae = true; *h2e = rsnx && rsnx[1] >= 1 && (rsnx[2] & 0x20);
+		return NULL;
+#else
+		if (!passphrase) return "SAE support is not built";
+#endif
 	}
 	if (!passphrase) {
 		return ("it does not take a passphrase's key of the WPA2 kind (WPA3 only, or an enterprise network)");
@@ -1418,13 +1542,19 @@ static void
 group_rekey(struct work_struct *work)
 {
 	struct lx_radio *radio = __containerof(work, struct lx_radio, group_work);
-	struct ieee80211_key_conf *old = radio->group_key;
 	int error = 0;
 
+	if (radio->group_key && radio->group_key->keyidx == radio->wpa.group_index &&
+	    !memcmp(radio->group_key->key, radio->wpa.group, 16)) return;
 	radio->rekeys++;
+	key_drop(radio, &radio->group_key, false);
 	radio->group_key = key_set(radio, radio->wpa.group, radio->wpa.group_index, false, &error);
 	lx_tell("lx: the group's new key (number %u) is given to the driver: %d\n", radio->wpa.group_index, error);
-	key_drop(radio, &old, false);
+	if (error) {
+		radio->joined = false;
+		lx_os_net_link(0);
+		lx_os_station_lost(EIO);
+	}
 }
 
 /* One step of the station's state as the driver is told of it (mac80211: drv_sta_state()). */
@@ -1478,6 +1608,7 @@ station_leave(struct lx_radio *radio)
 	key_drop(radio, &radio->group_key, false);
 	key_drop(radio, &radio->pairwise_key, true);
 	explicit_bzero(&radio->wpa, sizeof(radio->wpa));
+	explicit_bzero(radio->pmkid, sizeof(radio->pmkid));
 	for (; radio->sta != NULL && state > IEEE80211_STA_NOTEXIST; state--) {
 		station_state(radio, state, state - 1);
 	}
@@ -1502,6 +1633,7 @@ station_leave(struct lx_radio *radio)
 	kfree(radio->sta_memory);
 	radio->sta_memory = radio->sta = NULL;
 	radio->reached = IEEE80211_STA_NOTEXIST;
+	radio->sae = radio->h2e = false;
 }
 
 /*
@@ -1586,7 +1718,7 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 	if (name_length == 0 || name_length > sizeof(radio->want)) {
 		return (EINVAL);
 	}
-	if (what->security != HAKIOS_STA_WPA2_PSK) {
+	if (what->security != HAKIOS_STA_WPA2_PSK && what->security != HAKIOS_STA_WPA3_SAE) {
 		lx_tell("lx: a network without WPA2 and a passphrase is asked for: that is not built\n");
 		return (ENOTSUP);
 	}
@@ -1636,13 +1768,15 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 		/* (a beacon can be heard on the channel next to its own: where it says it is counts) */
 		channel = linuxkpi_ieee80211_get_channel(hw->wiphy, linuxkpi_ieee80211_channel_to_frequency(e[2], channel->band));
 	}
-	obstacle = protection(target, &group_cipher);
+	obstacle = protection(target, &group_cipher, &radio->sae, &radio->h2e);
+	if (!obstacle && what->security == HAKIOS_STA_WPA3_SAE && !radio->sae) obstacle = "the requested SAE AKM is not offered";
+	if (!obstacle && radio->sae && (!what->passphrase_length || what->passphrase_length > 63)) obstacle = "SAE needs the original passphrase";
 	lx_tell("lx: the network that is wanted: an access point on channel %u (%u MHz) at %d dBm, capabilities %#x, beacons every "
 	    "%u units; HT %s, VHT %s, WMM %s; %s%s\n", channel != NULL ? channel_of(channel->center_freq) : 0, channel != NULL ?
 	    channel->center_freq : 0, target->signal, target->capability, target->interval, element(target->elements,
 	    target->elements_length, 45) ? "yes" : "no", element(target->elements, target->elements_length, 191) ? "yes" : "no",
-	    vendor_element(target->elements, target->elements_length, wmm) ? "yes" : "no", obstacle == NULL ? "WPA2 with a "
-	    "passphrase and CCMP: it can be joined" : "IT CANNOT BE JOINED: ", obstacle == NULL ? "" : obstacle);
+	    vendor_element(target->elements, target->elements_length, wmm) ? "yes" : "no", obstacle == NULL ?
+	    (radio->sae ? "WPA3 SAE, CCMP and PMF" : "WPA2 PSK and CCMP") : "IT CANNOT BE JOINED: ", obstacle == NULL ? "" : obstacle);
 	if (obstacle != NULL || channel == NULL || (channel->flags & IEEE80211_CHAN_DISABLED)) {
 		return (ENOTSUP);
 	}
@@ -1650,9 +1784,10 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 	/* the key of the name and the passphrase, and what the handshake needs besides */
 	began = lx_os_nanoseconds();
 	bzero(&radio->wpa, sizeof(radio->wpa));
-	if (what->passphrase_length != 0) {
+	radio->wpa.sae = radio->sae;
+	if (!radio->sae && what->passphrase_length != 0) {
 		lx_wpa_pmk(what->passphrase, what->passphrase_length, name, name_length, radio->wpa.pmk);
-	} else {
+	} else if (!radio->sae) {
 		memcpy(radio->wpa.pmk, what->pmk, sizeof(radio->wpa.pmk));
 	}
 	memcpy(radio->wpa.own, vif->addr, ETH_ALEN);
@@ -1704,6 +1839,7 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 	memcpy(radio->sta->deflink.addr, target->address, ETH_ALEN);
 	radio->sta->deflink.sta = radio->sta;
 	radio->sta->link[0] = &radio->sta->deflink;
+	radio->sta->mfp = radio->sae;
 	station_abilities(radio, target->elements, target->elements_length);
 	ret = station_state(radio, IEEE80211_STA_NOTEXIST, IEEE80211_STA_NONE);
 	printf("lx: the access point is made known to the driver: %d\n", ret);
@@ -1716,6 +1852,13 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 	radio->reached = IEEE80211_STA_NONE;
 
 	/* authentication, of the kind that asks nothing ("open system": the passphrase is proved in the handshake) */
+#ifdef LX_HAVE_SAE
+	if (radio->sae) {
+		error = sae_authenticate(radio, what);
+		if (error) goto out;
+		answer = ANSWER_AUTHENTICATED;
+	} else
+#endif
 	for (unsigned attempt = 0; attempt < 3 && answer == ANSWER_NONE; attempt++) {
 		radio->answer = ANSWER_NONE;
 		if ((skb = frame_new(radio, 30, &frame)) == NULL) {

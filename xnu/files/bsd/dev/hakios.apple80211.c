@@ -165,6 +165,7 @@ struct apple80211_assoc {
 
 #define CIPHER_PMK              6
 #define CIPHER_PASSPHRASE       10
+#define AUTH_WPA3_SAE           0x1000u
 
 /* the link event's data (at least 32 bytes, or the framework drops the event) */
 struct apple80211_link_changed {
@@ -294,7 +295,8 @@ get(struct apple80211req *request)
 	switch (request->req_type) {
 	case 43:
 	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
-		static const char name[256] = "hakios: ath11k for the WCN6750";
+		char name[256] = { 0 };
+		strlcpy(name, hakios_is_raphael() ? "raphael: ath10k for the WCN3998" : "redwood: ath11k for the WCN6750", sizeof(name));
 
 		return give(request, name, sizeof(name));
 	}
@@ -311,6 +313,11 @@ get(struct apple80211req *request)
 
 		for (unsigned i = 0; i < sizeof(has); i++) {
 			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
+		}
+		if (hakios_is_raphael()) {
+			/* iOS 16.5 IO80211: byte 9 bit 3 selects SAE and passes CIPHER_PWD instead of a WPA2 PMK. */
+			bits[6] |= 1;                 /* protected management frames */
+			bits[9] |= 8;                 /* WPA3 Personal; no FT or enterprise */
 		}
 		return give(request, bits, sizeof(bits));
 	}
@@ -541,10 +548,11 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 	if (asked->key_length == 0) {
 		what->security = HAKIOS_STA_OPEN;
 	} else if (asked->key_cipher == CIPHER_PASSPHRASE && asked->key_length >= 8 && asked->key_length <= 63) {
-		what->security = HAKIOS_STA_WPA2_PSK;
+		what->security = asked->auth_upper & AUTH_WPA3_SAE ? HAKIOS_STA_WPA3_SAE : HAKIOS_STA_WPA2_PSK;
 		what->passphrase_length = (uint8_t)asked->key_length;
 		memcpy(what->passphrase, asked->key, asked->key_length);
 	} else if (asked->key_cipher == CIPHER_PMK && asked->key_length == sizeof(what->pmk)) {
+		if (asked->auth_upper & AUTH_WPA3_SAE) { error = EINVAL; goto out; }
 		what->security = HAKIOS_STA_WPA2_PSK;
 		memcpy(what->pmk, asked->key, sizeof(what->pmk));
 	} else {

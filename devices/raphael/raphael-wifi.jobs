@@ -1,0 +1,2 @@
+# Wait for a manual Settings join, then verify DHCP, DNS and HTTPS together.
+/redwood/bin/net_test wifi waitaddr en0 600 show resolve example.com tcp example.com 80 fetch https://www.apple.com/library/test/success.html

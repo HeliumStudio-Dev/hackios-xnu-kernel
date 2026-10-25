@@ -231,6 +231,9 @@ lx_os_rproc_boot(void)
 	return hakios_wifi_dsp_is_up() ? 0 : ENXIO;
 }
 
+extern bool hakios_wifi_icnss_ready(void);
+int lx_os_radio_powered(void) { return hakios_wifi_icnss_ready(); }
+
 int
 lx_os_radio_address(unsigned char *address)
 {
@@ -443,13 +446,14 @@ int
 lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument)
 {
 	kern_return_t kr;
+	if (hakios_is_raphael()) lx_irq_first = 446; /* SM8150 SNOC CE SPIs 414..425, level high. */
 
 	if (vector >= LX_VECTORS || lx_irq_first == 0 || function == NULL) {
 		return EINVAL;
 	}
 	if (lx_irq_thread == THREAD_NULL) {
-		hakios_wifi_tell("lx: wifi_irq: THE GIC'S DISTRIBUTOR IS WRITTEN for the radio's interrupts: each vector's SPI (%u + v) edge-"
-		    "triggered, group 1, routed to this processor, then enabled\n", lx_irq_first);
+		hakios_wifi_tell("lx: wifi_irq: the radio's SPIs (%u + v), %s-triggered, group 1, routed to this processor\n",
+		    lx_irq_first, hakios_is_raphael() ? "level" : "edge");
 		if (kernel_thread_start(lx_irq_runs, NULL, &lx_irq_thread) != KERN_SUCCESS) {
 			lx_irq_thread = THREAD_NULL;
 			return ENOMEM;
@@ -461,7 +465,7 @@ lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument)
 	lx_vector[vector].argument = argument;
 	lx_vector[vector].attached = true;
 	lck_mtx_unlock(&lx_irq_lock);
-	if ((kr = gic_v3_spi_attach(lx_irq_first + vector, true, lx_irq_arrived, NULL)) != KERN_SUCCESS) {
+	if ((kr = gic_v3_spi_attach(lx_irq_first + vector, !hakios_is_raphael(), lx_irq_arrived, NULL)) != KERN_SUCCESS) {
 		lck_mtx_lock(&lx_irq_lock);
 		lx_vector[vector].attached = false;
 		lck_mtx_unlock(&lx_irq_lock);

@@ -14,6 +14,7 @@ void lx_wpa_pmk(const unsigned char *passphrase, unsigned passphrase_length, con
     unsigned char pmk[32]);
 
 struct lx_wpa {
+	int sae;				/* SAE PMK: SHA256 PTK, AKM-defined AES-CMAC MIC and PMF */
 	unsigned char pmk[32];
 	unsigned char own[6], peer[6];		/* the station's address and the access point's */
 	unsigned char own_nonce[32];		/* 32 bytes nobody can guess, fresh for every handshake */
@@ -29,6 +30,8 @@ struct lx_wpa {
 	unsigned char group[32];		/* the key the access point sends to everybody with ("GTK") ... */
 	unsigned group_length, group_index;	/* ... its length, and its number (1 to 3) */
 	unsigned char group_counter[8];		/* ... and the packet number its frames have got to ("RSC") */
+	unsigned char igtk[16], igtk_counter[6];
+	unsigned igtk_index, igtk_valid;
 };
 
 /*
@@ -45,5 +48,6 @@ enum {
 };
 int lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length, unsigned char *reply,
     unsigned *reply_length, const char **why);
+int lx_wpa_mgmt(struct lx_wpa *wpa, const unsigned char *frame, unsigned length, int decrypted);
 
 #endif

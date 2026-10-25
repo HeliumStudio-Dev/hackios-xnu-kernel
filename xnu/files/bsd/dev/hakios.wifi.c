@@ -165,6 +165,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.qmi.h>
 #include <sys/hakios.qrtr.h>
 #include <sys/hakios.sta.h>
 #include <sys/stat.h>
@@ -195,6 +196,7 @@ LCK_MTX_DECLARE(hakios_smmu_lock, &wifi_lock_group);
 
 static uint32_t last_step, pause_ms = 2200, fine, watch_seconds = 3;
 static uint32_t step;                   /* the one being performed */
+static volatile bool raphael_wlan_crashed;
 static uint32_t new_from;               /* the first of the steps that have not been seen to work: they wait */
 static char last_write[96] = "nothing written";
 
@@ -359,6 +361,7 @@ hakios_wifi_option(const char *name)
 	if (PE_parse_boot_argn(name, &value, sizeof(value))) {
 		return value;
 	}
+	if (whole && hakios_is_raphael() && !strcmp(name, "wifi_ask")) return 1;
 	for (unsigned i = 0; whole && i < sizeof(stands_for) / sizeof(stands_for[0]); i++) {
 		if (strcmp(name, stands_for[i].name) == 0) {
 			return stands_for[i].value;
@@ -452,10 +455,11 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
  * how long. Who is who: we are processor 0; the Wi-Fi DSP is 13 (dt: qcom,remote-pid of
  * qcom,smp2p-wpss). Nothing here writes to this memory.
  */
-#define SMEM_PHYS               0x80900000UL
+static unsigned long smem_phys = 0x80900000UL;
+#define SMEM_PHYS               smem_phys
 #define SMEM_SIZE               0x00200000u
 #define SMEM_US                 0
-#define SMEM_WPSS               13
+static uint16_t SMEM_WPSS = 13;
 #define SMEM_GLOBAL             0xfffe          /* both "hosts" of the global partition */
 #define SMEM_VERSION            (0x40 + 4 * 7)  /* of the old header at the start: the boot loader's word, [31:16] */
 #define SMEM_VERSION_PARTITIONS 12              /* ... which is this where everything is in partitions */
@@ -487,9 +491,7 @@ struct smem_item {
 };
 
 /* The DSP's items (dt: qcom,smem of qcom,smp2p-wpss, qcom,smem-id of qcom,wpss@8a00000). */
-#define ITEM_SMP2P_OURS         616             /* SMP2P from us to the DSP: ours to allocate, when there is something to say */
-#define ITEM_SMP2P_THEIRS       617             /* ... and from the DSP to us */
-#define ITEM_CRASH_REASON       626             /* a line of text the DSP leaves when it gives up */
+static uint32_t ITEM_SMP2P_OURS = 616, ITEM_SMP2P_THEIRS = 617, ITEM_CRASH_REASON = 626;
 
 static const volatile uint8_t *smem;
 
@@ -602,7 +604,7 @@ static uint32_t
 smem_item(uint32_t item, uint32_t *size)
 {
 	static struct smem_item found[256];
-	static const uint16_t hosts[2][2] = { { SMEM_US, SMEM_WPSS }, { SMEM_GLOBAL, SMEM_GLOBAL } };
+	const uint16_t hosts[2][2] = { { SMEM_US, SMEM_WPSS }, { SMEM_GLOBAL, SMEM_GLOBAL } };
 
 	for (unsigned h = 0; h < 2; h++) {
 		uint32_t cacheline = 0, partition_size = 0;
@@ -776,7 +778,7 @@ step_smem(void)
 			    entry.host0, entry.host1, SMEM_PHYS + entry.offset, entry.size, entry.flags, entry.cacheline);
 		}
 	}
-	show_partition("us and the Wi-Fi DSP (0 and 13)", SMEM_US, SMEM_WPSS);
+	show_partition("us and the radio service DSP", SMEM_US, SMEM_WPSS);
 	show_partition("everybody (the global one)", SMEM_GLOBAL, SMEM_GLOBAL);
 
 	at = smem_item(ITEM_SMP2P_OURS, &size);
@@ -875,7 +877,7 @@ step_mailbox(void)
 /* ---- step 3: RPMh -------------------------------------------------------------------------------------- */
 
 /* dt: reserved-memory cmd_db@80860000: the boot loader's list of what RPMh can switch (cmd-db.c; as in hakios.adreno.c) */
-#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_PHYS             (hakios_is_raphael() ? 0x85f20000UL : 0x80860000UL)
 #define CMD_DB_SIZE             0x20000UL
 
 struct cmd_db_slave {
@@ -923,7 +925,8 @@ rpmh_resource(const char *name, uint32_t address)
 		const struct cmd_db_slave *slave = &cmd_db->slave[s];
 		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
 
-		if (slave->id == 0 || slave->count > 512) {
+		if (slave->id == 0 || slave->count > 512 ||
+		    (uint32_t)slave->header_offset + slave->count * sizeof(*entry) > CMD_DB_SIZE - __offsetof(struct cmd_db_header, data)) {
 			continue;
 		}
 		for (unsigned i = 0; i < slave->count; i++) {
@@ -1043,6 +1046,84 @@ step_rpmh(void)
 		}
 	}
 	return true;
+}
+
+static bool
+wifi_rpmh_write(const uint32_t *addresses, const uint32_t *values, unsigned count)
+{
+	uint32_t irq, done = 0;
+	vm_offset_t tcs;
+	if (count == 0 || count > 16) return false;
+	uint32_t all = (1u << count) - 1;
+	need(&rsc);
+	/* shortcut: step-mode only uses TCS1; serialize with camera before enabling a concurrent full driver. */
+	tcs = rsc.base + RSC_TCS(1);
+	if (rd(tcs + TCS_STATUS) == 0) return false;
+	irq = rd(rsc.base + RSC_TCS(0));
+	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) & ~(1u << 24));
+	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) & ~(1u << 16));
+	wr(rsc.base + RSC_TCS(0) + 8, 2);
+	for (unsigned i = 0; i < count; i++) {
+		wr(tcs + TCS_COMMAND(i), 0x10108);
+		wr(tcs + TCS_COMMAND(i) + 4, addresses[i]);
+		wr(tcs + TCS_COMMAND(i) + 8, values[i]);
+	}
+	wr(tcs + 0x10, all);
+	wr(tcs + TCS_ENABLED, all);
+	wr(rsc.base + RSC_TCS(0), irq | 2);
+	settle();
+	wr(tcs + TCS_CONTROL, 1u << 16);
+	wr(tcs + TCS_CONTROL, 1u << 16 | 1u << 24);
+	for (unsigned n = 0; n < 2000 && !done; n++) {
+		done = rd(rsc.base + RSC_TCS(0) + 4) & 2;
+		if (!done) sleep_us(100);
+	}
+	printf("wifi: RPMh TCS1 %u commands %s; first/last status %#x/%#x\n", count, done ? "accepted" : "timed out",
+	    rd(tcs + TCS_COMMAND(0) + 12), rd(tcs + TCS_COMMAND(count - 1) + 12));
+	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) & ~(1u << 24));
+	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) & ~(1u << 16));
+	wr(tcs + TCS_ENABLED, 0);
+	wr(tcs + 0x10, 0);
+	wr(rsc.base + RSC_TCS(0) + 8, 2);
+	wr(rsc.base + RSC_TCS(0), irq);
+	return done != 0;
+}
+
+/* Native pil_modem proxy votes: CX/MSS TURBO and the crystal oscillator. */
+static bool
+mpss_proxy(void)
+{
+	static const char *const names[] = { "cx.lvl", "mss.lvl", "xo.lvl" };
+	uint32_t addresses[3], values[3] = { 0, 0, 3 };
+	const uint32_t db_bytes = CMD_DB_SIZE - __offsetof(struct cmd_db_header, data);
+
+	for (unsigned i = 0; i < 3; i++) {
+		const struct cmd_db_entry *entry = rpmh_resource(names[i], 0);
+		bool found = i == 2;
+
+		if (entry == NULL || (entry->address >> 16 & 0xf) != 3) return false;
+		addresses[i] = entry->address;
+		if (i < 2) {
+			for (unsigned j = 0; j < 8; j++) {
+				const struct cmd_db_slave *slave = &cmd_db->slave[j];
+				const struct cmd_db_entry *first = (const void *)(cmd_db->data + slave->header_offset);
+				uint32_t start = (uint32_t)slave->data_offset + entry->offset;
+
+				if (entry < first || entry >= first + slave->count || start > db_bytes || entry->length > db_bytes - start) continue;
+				for (unsigned l = 0; l < entry->length / 2u; l++) {
+					const uint8_t *data = cmd_db->data + start + 2 * l;
+					uint32_t level = data[0] | data[1] << 8;
+
+					if (level == 0 && l != 0) break;
+					if (level >= 384) { values[i] = l; found = true; break; }
+				}
+			}
+		}
+		if (!found) { printf("wifi: MPSS has no TURBO position for %s\n", names[i]); return false; }
+		printf("wifi: MPSS proxy %s: address %#x, vote %u\n", names[i], addresses[i], values[i]);
+	}
+	/* shortcut: keep shared CX/XO proxy votes until reboot; replace with aggregated votes for normal Wi-Fi use. */
+	return wifi_rpmh_write(addresses, values, 3);
 }
 
 /* ---- step 4: the supplies themselves ------------------------------------------------------------------- */
@@ -1258,9 +1339,8 @@ step_pins(void)
 
 /* ---- step 6: the firmware ------------------------------------------------------------------------------ */
 
-#define PAS_WPSS                6               /* dt: qcom,pas-id of qcom,wpss@8a00000 */
-#define WPSS_MEMORY             0x9ae00000u     /* dt: reserved-memory wlan@9ae00000, that node's memory-region */
-#define WPSS_MEMORY_SIZE        0x01900000u
+static uint32_t PAS_WPSS = 6, WPSS_MEMORY = 0x9ae00000u, WPSS_MEMORY_SIZE = 0x01900000u;
+static const char *dsp_image_name = "wpss";
 
 extern dev_t mdevlookup(int devid);
 extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
@@ -1291,7 +1371,7 @@ image_file(const char *name, uint64_t *size)
  * where the memory reserved for the DSP is, which on this phone is where they say they are.
  */
 #define MDT_HASH(flags)         (((flags) >> 24 & 7) == 2)      /* the segment that is the block of hashes */
-#define MAX_SEGMENTS            16
+#define MAX_SEGMENTS            64
 
 struct elf_segment {
 	uint32_t type, offset, vaddr, paddr, file_size, memory_size, flags, align;
@@ -1316,18 +1396,23 @@ step_firmware(void)
 	const uint8_t *header;
 	uint64_t size = 0, files = 0;
 	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
+	char header_name[16];
 
 	announce("find the DSP's image in the small image that came with the kernel, and check it against its own header");
 	image.segments = 0;
-	header = image_file("wpss.mdt", &size);
+	snprintf(header_name, sizeof(header_name), "%s.mdt", dsp_image_name);
+	header = image_file(header_name, &size);
 	if (header == NULL) {
 		return false;
 	}
-	/* a 32-bit ELF: the count of segments at 44, the table of them at 52, 32 bytes each */
-	count = size >= 52 + 2 * 32 ? header[44] | header[45] << 8 : 0;
-	if (memcmp(header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS || 52 + 32 * count > size || size > PAGE_SIZE) {
-		printf("wifi: %u: fw/wpss.mdt is not such a header (%02x %02x %02x %02x, %u segments, %llu bytes)\n", step, header[0],
-		    header[1], header[2], header[3], count, size);
+	if (size < 52 || memcmp(header, "\177ELF\1\1", 6) != 0 ||
+	    header[28] != 52 || header[29] || header[30] || header[31] || header[42] != 32 || header[43]) {
+		printf("wifi: %u: fw/%s is not a supported ELF32 little-endian header (%llu bytes)\n", step, header_name, size);
+		return false;
+	}
+	count = header[44] | header[45] << 8;
+	if (count < 3 || count > MAX_SEGMENTS || 52 + 32 * count > size || size > PAGE_SIZE) {
+		printf("wifi: %u: fw/%s has an invalid segment table (%u segments, %llu bytes)\n", step, header_name, count, size);
 		return false;
 	}
 	for (uint32_t i = 0; i < count; i++) {
@@ -1353,7 +1438,7 @@ step_firmware(void)
 		if (segment.file_size != 0) {
 			uint64_t file_size = 0;
 
-			snprintf(name, sizeof(name), "wpss.b%02u", i);
+			snprintf(name, sizeof(name), "%s.b%02u", dsp_image_name, i);
 			image.segment[image.segments].file = image_file(name, &file_size);
 			if (image.segment[image.segments].file == NULL) {
 				return false;
@@ -1403,6 +1488,15 @@ mailbox_wait(uint32_t offset, uint32_t value, uint32_t ms)
 static void
 ring(uint32_t client, uint32_t signal, const char *whose)
 {
+	if (hakios_is_raphael()) {
+		static vm_offset_t apcs;
+		if (!apcs) apcs = ml_io_map(0x17c00000, 0x1000);
+		settle();
+		if (client == IPCC_AOP) wr(apcs + 0xc, 1);
+		else if (signal == IPCC_SMP2P) wr(apcs + 0xc, 1u << 14);
+		else wr(apcs + 0xc, 1u << 12);
+		return;
+	}
 	put(&ipcc, whose, IPCC_SEND, client << 16 | signal);
 }
 
@@ -1420,6 +1514,7 @@ static struct {
 static void
 doorbells(void)
 {
+	if (hakios_is_raphael()) return; /* SM8150 uses APCS, and the shared queues are polled. */
 	for (unsigned i = 0; i < 8; i++) {
 		uint32_t who = rd(ipcc.base + IPCC_RECEIVED);
 
@@ -1519,7 +1614,7 @@ step_mailbox_open_locked(void)
 		ring(IPCC_AOP, 0, "the always-on processor's doorbell");
 		return false;
 	}
-	printf("wifi: %u: THE MAILBOX TO THE ALWAYS-ON PROCESSOR IS OPEN; the doorbells say %#x\n", step, rd(ipcc.base + IPCC_RECEIVED));
+	printf("wifi: %u: THE MAILBOX TO THE ALWAYS-ON PROCESSOR IS OPEN\n", step);
 	our_box = box;
 	return true;
 }
@@ -1563,7 +1658,7 @@ mailbox_send_locked(const char *text)
 	}
 	wr(aoss.base + our_box, QMP_MESSAGE);
 	(void)rd(aoss.base + our_box);
-	wr(ipcc.base + IPCC_SEND, IPCC_AOP << 16 | 0);
+	ring(IPCC_AOP, 0, "the always-on processor's doorbell");
 	if (!mailbox_wait(our_box, 0, 1000)) {
 		printf("wifi: %u: THE ALWAYS-ON PROCESSOR DOES NOT TAKE THE MESSAGE within a second; it is taken back\n", step);
 		wr(aoss.base + our_box, 0);
@@ -1571,6 +1666,15 @@ mailbox_send_locked(const char *text)
 	}
 	printf("wifi: %u: the always-on processor has taken it\n", step);
 	return true;
+}
+
+static bool
+dsp_load_state(bool on)
+{
+	char message[96];
+
+	snprintf(message, sizeof(message), "{class: image, res: load_state, name: %s, val: %s}", dsp_image_name, on ? "on" : "off");
+	return mailbox_send(message);
 }
 
 /* ---- SMP2P, our half ----------------------------------------------------------------------------------- */
@@ -1588,6 +1692,8 @@ mailbox_send_locked(const char *text)
 #define DSP_STOP                (1u << 0)       /* of "master-kernel" */
 
 static void glink_reset(void);
+static bool glink_prepare(void);
+static bool mpss_storage_prepare(void);
 static void link_stop(void);
 
 static uint32_t our_item;               /* where our SMP2P item is in the area; 0: not looked for, or not there */
@@ -1636,7 +1742,7 @@ dsp_listen(const struct smp2p *theirs)
 		    "its SMP2P doorbell\n", step, theirs->flags, SMEM_PHYS + our_item + SMP2P_AT_FLAGS, smp2p_restart_acked);
 		smem_poke(our_item + SMP2P_AT_FLAGS, (ours.flags & ~SMP2P_RESTART_ACK) | (smp2p_restart_acked ? SMP2P_RESTART_ACK : 0));
 		settle();
-		wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_SMP2P);
+		ring(IPCC_WPSS, IPCC_SMP2P, "the DSP's SMP2P doorbell");
 	}
 }
 
@@ -1680,7 +1786,7 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	hold(true);
 	smem_poke(value_at, ours.entry[entry].value | DSP_STOP);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_SMP2P);
+	ring(IPCC_WPSS, IPCC_SMP2P, "the DSP's SMP2P doorbell");
 	asked = now = now_us();
 	while (now - asked < bound_ms * 1000ull) {
 		if (dsp_words(&theirs) && (dsp_state(&theirs) & (DSP_STOP_ACK | DSP_FATAL))) {
@@ -1696,7 +1802,7 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	/* (taken back, as Linux does, before TrustZone is asked) */
 	smem_poke(value_at, ours.entry[entry].value & ~DSP_STOP);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_SMP2P);
+	ring(IPCC_WPSS, IPCC_SMP2P, "the DSP's SMP2P doorbell");
 	return (state & DSP_STOP_ACK) != 0;
 }
 
@@ -1722,7 +1828,7 @@ static uint32_t dirty;
 
 /* One call, as Linux makes these: one that may be preempted. What TrustZone returns: 0 or an error of its own, and a word of answer. */
 static int32_t
-scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third, uint64_t *answer)
+scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third, uint64_t more, uint64_t *answer)
 {
 	uint64_t session = 0;
 
@@ -1737,7 +1843,7 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 		register uint64_t x2 __asm__("x2") = first;
 		register uint64_t x3 __asm__("x3") = second;
 		register uint64_t x4 __asm__("x4") = third;
-		register uint64_t x5 __asm__("x5") = 0;
+		register uint64_t x5 __asm__("x5") = more;
 		register uint64_t x6 __asm__("x6") = session;
 		register uint64_t x7 __asm__("x7") = 0;
 
@@ -1760,6 +1866,8 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
  * image is gone: it was told of one by us, or by the kernel that left the DSP running.
  */
 static void radio_space_off(void);
+static void mpss_storage_stop(void);
+static void icnss_memory_stop(void);
 
 static bool
 dsp_shutdown(const char *why)
@@ -1775,16 +1883,17 @@ dsp_shutdown(const char *why)
 		link_stop();
 	}
 	stopped_by_its_word = dsp_ask_to_stop(leaving ? 2000 : 5000);
-	result = scm("to shut the Wi-Fi DSP down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_WPSS, 0, 0, &answer);
+	result = scm("to shut the Wi-Fi DSP down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_WPSS, 0, 0, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("wifi: %u: TRUSTZONE DOES NOT SHUT THE DSP DOWN: the call returns %d, its answer is %#llx\n", step, result, answer);
 		return false;
 	}
 	printf("wifi: %u: THE WI-FI DSP IS SHUT DOWN\n", step);
-	wr(ipcc.base + IPCC_DISABLE, IPCC_WPSS << 16 | IPCC_SMP2P);     /* (as the boot chain left it) */
+	if (hakios_is_raphael()) { icnss_memory_stop(); mpss_storage_stop(); }
+	if (!hakios_is_raphael()) wr(ipcc.base + IPCC_DISABLE, IPCC_WPSS << 16 | IPCC_SMP2P);     /* (as the boot chain left it) */
 	doorbells();
 	dsp_started = false;
-	mailbox_send("{class: image, res: load_state, name: wpss, val: off}");
+	dsp_load_state(false);
 	/*
 	 * Nobody is left to use the radio's stream. Only after a DSP of ours: with wifi=1 the radio
 	 * is shown its memory before the DSP is started, and the shutdown of an earlier kernel's
@@ -1811,6 +1920,10 @@ step_header(void)
 		return false;
 	}
 	if (dsp_words(&words)) {
+		if (hakios_is_raphael() && !(dsp_state(&words) & DSP_STOP_ACK)) {
+			printf("wifi: MPSS has no acknowledged stop; header loading refused until a cold reset\n");
+			return false;
+		}
 		/* (see the top of this file: it has run since the phone was started, and may be running) */
 		show_words("the DSP has left words in the shared memory", &words);
 		announce("ask TrustZone to shut down a DSP that a kernel before this one may have left running");
@@ -1827,7 +1940,7 @@ step_header(void)
 		    "there is nothing to shut down\n", step);
 	}
 
-	announce("hand the image's header to TrustZone to check its signature (image 6), in a page of ours");
+	announce("hand the image's header to TrustZone to check its signature, in a page of ours");
 	/* in memory of ours, page-aligned and in one piece, not touched again and never freed (see hakios.adreno.c) */
 	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		printf("wifi: %u: no memory\n", step);
@@ -1838,7 +1951,7 @@ step_header(void)
 		__asm__ volatile ("dc civac, %0" : : "r" (line));       /* TrustZone reads memory, not this processor's cache */
 	}
 	settle();
-	result = scm("to take the Wi-Fi DSP's header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_WPSS, kvtophys(page), 0, &answer);
+	result = scm("to take the Wi-Fi DSP's header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_WPSS, kvtophys(page), 0, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("wifi: %u: TRUSTZONE DOES NOT TAKE THE HEADER: the call returns %d, its answer is %#llx\n", step, result, answer);
 		return false;
@@ -1846,7 +1959,7 @@ step_header(void)
 	printf("wifi: %u: TRUSTZONE ACCEPTS THE WI-FI DSP'S SIGNATURE FROM THIS KERNEL\n", step);
 
 	announce("tell TrustZone where the image will be");
-	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_WPSS, WPSS_MEMORY, image.size, &answer);
+	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_WPSS, WPSS_MEMORY, image.size, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("wifi: %u: TRUSTZONE DOES NOT TAKE THE PLACE: the call returns %d, its answer is %#llx\n", step, result, answer);
 		return false;
@@ -1880,19 +1993,20 @@ step_image(void)
 	if (image.segments == 0) {
 		return false;
 	}
-	announce("put the image's segments into the DSP's memory (0x9ae00000, 25 MB: memory of nobody's until TrustZone "
-	    "starts the DSP), with zeroes where a segment is longer than its file, and read them back");
+	announce("put the image's segments into its reserved DSP memory, zero the remainder of each segment, and read them back");
 	/*
 	 * (The memory is looked at only now: TrustZone has just said that it is not its own. And it
 	 * is mapped for as long as this takes: 25 MB do not fit where ml_io_map() puts what stays.)
 	 */
 	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(WPSS_MEMORY, WPSS_MEMORY_SIZE, VM_WIMG_WCOMB);
+	if (dsp_memory == NULL) return false;
 	printf("wifi: %u: the memory begins %#llx, the image %#llx\n", step, dsp_memory[0], segment_word(0, 0));
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
 
-		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
-			printf("wifi: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
+		if (image.segment[s].at & 7) {
+			printf("wifi: %u: a segment that does not begin at a multiple of eight bytes: not written\n", step);
+			ml_io_unmap((vm_offset_t)dsp_memory, WPSS_MEMORY_SIZE);
 			return false;
 		}
 		printf("wifi: %u: about to write %#x bytes at %#x (%#x of them the file's)\n", step, image.segment[s].memory_size,
@@ -1900,8 +2014,12 @@ step_image(void)
 		snprintf(last_write, sizeof(last_write), "step %u wrote a segment of the image at %#x", step,
 		    WPSS_MEMORY + image.segment[s].at);
 		hold(true);
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
+		uint32_t whole = image.segment[s].memory_size & ~7u;
+		for (uint32_t i = 0; i < whole; i += 8) {
 			to[i / 8] = segment_word(s, i);
+		}
+		for (uint32_t i = whole; i < image.segment[s].memory_size; i++) {
+			((volatile uint8_t *)to)[i] = (uint8_t)segment_word(s, i);
 		}
 		written += image.segment[s].file_size;
 		cleared += image.segment[s].memory_size - image.segment[s].file_size;
@@ -1910,8 +2028,12 @@ step_image(void)
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *from = dsp_memory + image.segment[s].at / 8;
 
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
+		uint32_t whole = image.segment[s].memory_size & ~7u;
+		for (uint32_t i = 0; i < whole; i += 8) {
 			wrong += from[i / 8] != segment_word(s, i);
+		}
+		for (uint32_t i = whole; i < image.segment[s].memory_size; i++) {
+			wrong += ((volatile uint8_t *)from)[i] != (uint8_t)segment_word(s, i);
 		}
 	}
 	printf("wifi: %u: %llu bytes written and %llu cleared; read back, %llu words of eight bytes differ\n", step, written, cleared,
@@ -1937,33 +2059,34 @@ static struct block smem_lock = { "shared memory's lock", 0x01f43000, 0x1000 };
 #define LOCK_US                 1u
 
 /* Our item made in the partition, as Linux's qcom_smem_alloc_private() makes one. False, and why said: not made. */
-static bool our_item_make_locked(uint32_t partition);
+static bool smem_item_make_locked(uint32_t partition, uint16_t item, uint32_t bytes);
 
 static bool
-our_item_make(uint32_t partition)
+smem_item_make(uint32_t partition, uint16_t item, uint32_t bytes)
 {
 	bool made;
 
 	lck_mtx_lock(&hakios_smem_alloc_lock);
-	made = our_item_make_locked(partition);
+	made = smem_item_make_locked(partition, item, bytes);
 	lck_mtx_unlock(&hakios_smem_alloc_lock);
 	return made;
 }
 
 static bool
-our_item_make_locked(uint32_t partition)
+smem_item_make_locked(uint32_t partition, uint16_t item, uint32_t bytes)
 {
 	struct smem_partition header;
 	struct smem_entry entry;
-	const uint32_t item_size = (sizeof(struct smp2p) + 7) & ~7u, need = sizeof(entry) + item_size;
+	const uint32_t item_size = (bytes + 7) & ~7u, need = sizeof(entry) + item_size;
 	uint32_t owner = ~0u, at;
 	bool made = false;
 
+	if (bytes == 0 || bytes > SMEM_SIZE || partition == 0 || partition > SMEM_SIZE - sizeof(header)) return false;
 	owner = get(&smem_lock, "owner", LOCK_OWNER);
 	printf("wifi: %u: about to take the lock (write %u at %#x, until it reads back so, for a second at most), write an entry "
 	    "of %u bytes for item %u with %u bytes behind it where the partition's items from the bottom end, move the "
 	    "partition's mark by %u, and release the lock (write 0)\n", step, LOCK_US, smem_lock.phys + LOCK_OWNER,
-	    (uint32_t)sizeof(entry), ITEM_SMP2P_OURS, item_size, need);
+	    (uint32_t)sizeof(entry), item, item_size, need);
 	snprintf(last_write, sizeof(last_write), "step %u took the shared memory's lock", step);
 	hold(true);
 	for (uint32_t ms = 0; ms <= 1000; ms++) {
@@ -1979,15 +2102,22 @@ our_item_make_locked(uint32_t partition)
 		return false;
 	}
 	/* under the lock: the partition as it is now, every entry in it from the bottom, and the room left */
-	if (!smem_peek(partition, &header, sizeof(header)) || header.free_uncached > header.free_cached ||
-	    header.free_cached > header.size) {
+	if (!smem_peek(partition, &header, sizeof(header)) || memcmp(header.magic, "$PRT", 4) != 0 ||
+	    header.size > SMEM_SIZE - partition || header.free_uncached < sizeof(header) ||
+	    header.free_uncached > header.free_cached || header.free_cached > header.size) {
 		printf("wifi: %u: the partition's marks make no sense: nothing is written\n", step);
 		goto out;
 	}
 	for (at = sizeof(header); at < header.free_uncached;) {
-		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == ITEM_SMP2P_OURS ||
-		    entry.size > header.size) {
+		if (header.free_uncached - at < sizeof(entry) || !smem_peek(partition + at, &entry, sizeof(entry)) ||
+		    entry.canary != SMEM_CANARY || entry.padding_data > entry.size ||
+		    entry.padding_header > header.free_uncached - at - sizeof(entry) ||
+		    entry.size > header.free_uncached - at - sizeof(entry) - entry.padding_header) {
 			break;
+		}
+		if (entry.item == item) {
+			made = entry.size - entry.padding_data == bytes;
+			goto out;
 		}
 		at += sizeof(entry) + entry.padding_header + entry.size;
 	}
@@ -1996,14 +2126,14 @@ our_item_make_locked(uint32_t partition)
 		    "nothing is written\n", step, at, header.free_uncached);
 		goto out;
 	}
-	if (at + need > header.free_cached) {
+	if (need > header.free_cached - at) {
 		printf("wifi: %u: no room: %u bytes wanted, %u free: nothing is written\n", step, need, header.free_cached - at);
 		goto out;
 	}
 	/* the entry first, whole; only then the mark, in one store: nobody sees half of either */
-	smem_poke(partition + at, SMEM_CANARY | ITEM_SMP2P_OURS << 16);
+	smem_poke(partition + at, SMEM_CANARY | (uint32_t)item << 16);
 	smem_poke(partition + at + 4, item_size);
-	smem_poke(partition + at + 8, item_size - (uint32_t)sizeof(struct smp2p));     /* padding behind the item; none in front */
+	smem_poke(partition + at + 8, item_size - bytes);     /* padding behind the item; none in front */
 	smem_poke(partition + at + 12, 0);
 	settle();
 	smem_poke(partition + __offsetof(struct smem_partition, free_uncached), at + need);
@@ -2020,17 +2150,18 @@ static bool
 step_our_item(void)
 {
 	static const char *const names[] = { OUR_ENTRY_STOP, OUR_ENTRY_RADIO };
+	uint32_t count = hakios_is_raphael() ? 1 : sizeof(names) / sizeof(names[0]);
 	struct smem_partition header;
 	struct smp2p ours;
 	uint32_t cacheline = 0, size = 0, partition;
 
-	announce("look at our partition with the DSP in the shared memory, and for an SMP2P item of ours (616) in it");
+	announce("look for our SMP2P item in the private partition with the DSP");
 	partition = smem_partition(SMEM_US, SMEM_WPSS, &cacheline, &size);
 	if (partition == 0 || !smem_peek(partition, &header, sizeof(header))) {
 		printf("wifi: %u: there is no such partition\n", step);
 		return false;
 	}
-	show_partition("us and the Wi-Fi DSP (0 and 13)", SMEM_US, SMEM_WPSS);
+	show_partition("us and the radio service DSP", SMEM_US, SMEM_WPSS);
 	printf("wifi: %u: its items from the bottom end at +%#x, those from the top begin at +%#x\n", step, header.free_uncached,
 	    header.free_cached);
 	our_item = our_item_find();
@@ -2039,7 +2170,7 @@ step_our_item(void)
 		    ITEM_SMP2P_OURS, SMEM_PHYS + our_item);
 	} else {
 		announce("make the item: the SoC's lock for the shared memory (0x1f43000: the first access to that block) around it");
-		if (!our_item_make(partition)) {
+		if (!smem_item_make(partition, ITEM_SMP2P_OURS, sizeof(ours))) {
 			return false;
 		}
 		our_item = our_item_find();
@@ -2048,12 +2179,11 @@ step_our_item(void)
 			return false;
 		}
 		printf("wifi: %u: item %u made, at %#lx\n", step, ITEM_SMP2P_OURS, SMEM_PHYS + our_item);
-		show_partition("us and the Wi-Fi DSP (0 and 13)", SMEM_US, SMEM_WPSS);
+		show_partition("us and the radio service DSP", SMEM_US, SMEM_WPSS);
 	}
 
-	announce("fill our item in (340 bytes at the address above): zeroes, then from processor 0 to 13, room for 16 entries, "
-	    "the entries \"master-kernel\" and \"wlan\" at zero, feature bit 0, and last the version, which makes it valid; "
-	    "then the DSP's SMP2P doorbell, as Linux rings it");
+	printf("wifi: %u: publish SMP2P from processor %u to %u: %u entries, version %u\n", step, SMEM_US, SMEM_WPSS, count, SMP2P_VERSION);
+
 	snprintf(last_write, sizeof(last_write), "step %u filled in our SMP2P item", step);
 	for (uint32_t at = 0; at < sizeof(ours); at += 4) {
 		smem_poke(our_item + at, 0);
@@ -2061,7 +2191,7 @@ step_our_item(void)
 	settle();
 	smem_poke(our_item, SMP2P_MAGIC);
 	smem_poke(our_item + SMP2P_AT_PROCESSORS, SMEM_US | SMEM_WPSS << 16);
-	for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+	for (uint32_t i = 0; i < count; i++) {
 		uint32_t name[4] = { 0 };
 
 		strlcpy((char *)name, names[i], sizeof(name));
@@ -2069,7 +2199,7 @@ step_our_item(void)
 			smem_poke(our_item + SMP2P_AT_NAME(i) + 4 * word, name[word]);
 		}
 	}
-	smem_poke(our_item + SMP2P_AT_COUNTS, 16 | (uint32_t)(sizeof(names) / sizeof(names[0])) << 16);
+	smem_poke(our_item + SMP2P_AT_COUNTS, 16 | count << 16);
 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8);
 	settle();
 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8 | SMP2P_VERSION);
@@ -2083,7 +2213,9 @@ step_our_item(void)
 	show_words("our item reads back", &ours);
 
 	announce("see that our two marks in GLINK's descriptor are at zero before the DSP starts");
+	if (hakios_is_raphael() && !glink_prepare()) return false;
 	glink_reset();
+	if (hakios_is_raphael() && last_step >= 14 && hakios_wifi_option("wifi_ask") && !mpss_storage_prepare()) return false;
 	return true;
 }
 
@@ -2131,25 +2263,26 @@ step_start(void)
 	announce("tell the doorbells that rings from before this kernel have been heard and that the DSP's SMP2P ring is "
 	    "listened for, tell the always-on processor that the image is loaded, and ask TrustZone to authenticate it and let "
 	    "the DSP out of reset");
-	/* (nobody answered them, and a ring after the start is to be the DSP's) */
-	for (unsigned i = 0; i < 8 && (rang = rd(ipcc.base + IPCC_RECEIVED)) != IPCC_NOBODY; i++) {
-		put(&ipcc, "heard", IPCC_CLEAR, rang);
+	if (!hakios_is_raphael()) {
+		for (unsigned i = 0; i < 8 && (rang = rd(ipcc.base + IPCC_RECEIVED)) != IPCC_NOBODY; i++) {
+			put(&ipcc, "heard", IPCC_CLEAR, rang);
+		}
+		put(&ipcc, "listened for", IPCC_ENABLE, IPCC_WPSS << 16 | IPCC_SMP2P);
 	}
-	/* (the boot chain listens for the DSP's GLINK ring and no other: without this an SMP2P ring leaves no trace) */
-	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_WPSS << 16 | IPCC_SMP2P);
 	bzero(&doorbell, sizeof(doorbell));
+	if (hakios_is_raphael() && !mpss_proxy()) return false;
 	lck_mtx_lock(&dsp_lock);
-	if (!mailbox_send("{class: image, res: load_state, name: wpss, val: on}")) {
+	if (!dsp_load_state(true)) {
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
-	result = scm("to authenticate the Wi-Fi DSP's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_WPSS, 0, 0,
+	result = scm("to authenticate the Wi-Fi DSP's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_WPSS, 0, 0, 0,
 	    &answer);
 	doorbell.since = started = now_us();
 	image_written = false;                  /* (whatever the answer: the memory is not ours to look at now) */
 	if (result != 0 || answer != 0) {
 		printf("wifi: %u: TRUSTZONE DOES NOT START THE DSP: the call returns %d, its answer is %#llx\n", step, result, answer);
-		mailbox_send("{class: image, res: load_state, name: wpss, val: off}");
+		dsp_load_state(false);
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
@@ -2318,6 +2451,32 @@ glink_find(void)
 	       !(glink.ours_size & 7) && !(glink.theirs_size & 7);
 }
 
+/* MPSS has no boot-chain GLINK allocation: APPS owns the descriptor and TX queue. */
+static bool
+glink_prepare(void)
+{
+	static const uint16_t items[] = { ITEM_GLINK_DESCRIPTOR, ITEM_GLINK_OUR_QUEUE };
+	static const uint32_t lengths[] = { 32, 16384 };
+	uint32_t cacheline = 0, bytes = 0, partition = smem_partition(SMEM_US, SMEM_WPSS, &cacheline, &bytes);
+
+	if (partition == 0) return false;
+	for (unsigned i = 0; i < 2; i++) {
+		uint32_t at = smem_item(items[i], &bytes);
+
+		if (at != 0) {
+			if (bytes != lengths[i]) return false;
+			continue;
+		}
+		if (!smem_item_make(partition, items[i], lengths[i])) return false;
+		at = smem_item(items[i], &bytes);
+		if (at == 0 || bytes != lengths[i]) return false;
+		for (uint32_t n = 0; n < bytes; n += 4) smem_poke(at + n, 0);
+		settle();
+		printf("wifi: MPSS GLINK item %u prepared: %u bytes at %#lx\n", items[i], bytes, SMEM_PHYS + at);
+	}
+	return true;
+}
+
 /* Our two marks to zero, if they are not: before the DSP starts (see above). */
 static void
 glink_reset(void)
@@ -2399,7 +2558,7 @@ glink_put(const void *first, uint32_t first_length, const void *second, uint32_t
 	settle();
 	smem_poke(glink.descriptor + GLINK_OUR_HEAD, (head + padded) % glink.ours_size);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_GLINK);
+	ring(IPCC_WPSS, IPCC_GLINK, "the DSP's GLINK doorbell");
 	glink.said++;
 	return true;
 }
@@ -2619,7 +2778,7 @@ glink_pump(void)
 		}
 		case GLINK_READ_NOTIFY:
 			glink_advance(length);
-			wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_GLINK);
+			ring(IPCC_WPSS, IPCC_GLINK, "the DSP's GLINK doorbell");
 			break;
 		case GLINK_CLOSE:
 			glink_advance(length);
@@ -2759,7 +2918,8 @@ static struct {
 	uint32_t service, instance, node, port;
 	bool there;
 } qrtr_servers[64];
-static uint32_t qrtr_peer;                      /* the DSP's node; 0: it has not said */
+static uint32_t qrtr_peer;                      /* node 0 is a valid MPSS node */
+static bool qrtr_peer_known;
 static uint32_t qrtr_next_port = QRTR_FIRST_PORT, qrtr_in, qrtr_out, qrtr_hellos;
 static thread_t link_thread_is;
 
@@ -2862,13 +3022,16 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 		qrtr_tell(control->words[0], control->words[1], control->words[2], control->words[3], true);
 		break;
 	case QRTR_DEL_SERVER:
+	case QRTR_DEL_CLIENT:
 	case QRTR_BYE:
 		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
 			bool gone;
+			uint32_t node = control->words[control->command == QRTR_DEL_CLIENT ? 0 : 2];
+			uint32_t port = control->words[control->command == QRTR_DEL_CLIENT ? 1 : 3];
 
 			lck_mtx_lock(&qrtr_lock);
 			gone = qrtr_servers[i].there && (control->command == QRTR_BYE ? qrtr_servers[i].node == header->from_node :
-			    qrtr_servers[i].node == control->words[2] && qrtr_servers[i].port == control->words[3]);
+			    qrtr_servers[i].node == node && qrtr_servers[i].port == port);
 			qrtr_servers[i].there = qrtr_servers[i].there && !gone;
 			lck_mtx_unlock(&qrtr_lock);
 			if (gone) {
@@ -2912,13 +3075,13 @@ qrtr_input(const uint8_t *data, uint32_t length)
 		printf("wifi: qrtr: %u bytes that are no datagram (they begin %#x)\n", length, length ? data[0] : 0);
 		return;
 	}
-	if (header.size == 0 || at + header.size > length) {
+	if (header.size == 0 || at > length || header.size > length - at) {
 		printf("wifi: qrtr: a datagram of %u bytes in a message of %u: dropped\n", header.size, length);
 		return;
 	}
 	qrtr_in++;
-	if (qrtr_peer == 0) {
-		qrtr_peer = header.from_node;
+	if (!qrtr_peer_known) {
+		qrtr_peer = header.from_node; qrtr_peer_known = true;
 	}
 	if (header.type == QRTR_RESUME_TX) {
 		return;                                 /* (we never ask for one: GLINK's intents hold us back already) */
@@ -2932,7 +3095,10 @@ qrtr_input(const uint8_t *data, uint32_t length)
 	if (header.to_port == QRTR_CONTROL) {
 		struct qrtr_control control = { 0 };
 
+		if (header.size < sizeof(control.command)) return;
 		memcpy(&control, data + at, header.size < sizeof(control) ? header.size : sizeof(control));
+		if ((control.command == QRTR_NEW_SERVER || control.command == QRTR_DEL_SERVER) && header.size < 20) return;
+		if ((control.command == QRTR_DEL_CLIENT || control.command == QRTR_RESUME_TX) && header.size < 12) return;
 		qrtr_control(&header, &control);
 		return;
 	}
@@ -3046,7 +3212,7 @@ qrtr_close(struct hakios_qrtr_port *port)
 	if (outside) {
 		lck_mtx_unlock(&qrtr_calling);
 	}
-	if (qrtr_peer != 0) {
+	if (qrtr_peer_known) {
 		qrtr_out_packet(QRTR_DEL_CLIENT, gone.words[1], qrtr_peer, QRTR_CONTROL, &gone, sizeof(gone));
 	}
 }
@@ -3081,6 +3247,9 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 		link_wait();
 		doorbells();
 		if (dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
+			if (hakios_is_raphael()) show_words("MPSS changed", &words);
+			int wlan = smp2p_entry(&words, "wlan");
+			if (hakios_is_raphael() && wlan >= 0 && (words.entry[wlan].value & 2)) raphael_wlan_crashed = true;
 			last = words;
 			dsp_listen(&words);
 			if ((dsp_state(&words) & DSP_FATAL) && !gave_up) {
@@ -3139,7 +3308,7 @@ link_stop(void)
 	lck_mtx_unlock(&glink_lock);
 	lck_mtx_lock(&qrtr_lock);
 	bzero(qrtr_servers, sizeof(qrtr_servers));
-	qrtr_peer = 0;
+	qrtr_peer = 0; qrtr_peer_known = false;
 	lck_mtx_unlock(&qrtr_lock);
 }
 
@@ -3232,24 +3401,1038 @@ step_link(void)
 
 static uint32_t wlfw_node, wlfw_port;
 static volatile uint32_t wlfw_answer;           /* bytes of an answer received; 0: none */
-static uint8_t wlfw_answer_bytes[64];
+static uint8_t wlfw_answer_bytes[1024];
+static uint16_t wlfw_transaction, wlfw_expected;
+static volatile bool wlfw_ready, wlfw_msa_ready;
+static volatile bool wlfw_rejuvenating;
+static bool wlfw_connected;
+static uint32_t wlfw_next_node, wlfw_next_port;
+static bool icnss_mac_valid;
+static uint8_t icnss_mac[6];
 
 static void
 wlfw_service(__unused void *context, bool arrived, __unused uint32_t service, __unused uint32_t version, __unused uint32_t instance,
     uint32_t node, uint32_t port)
 {
+	if (!arrived && node == wlfw_next_node && port == wlfw_next_port) wlfw_next_port = 0;
+	if (!arrived && (node != wlfw_node || port != wlfw_port)) return;
+	if (wlfw_connected && arrived && (node != wlfw_node || port != wlfw_port)) {
+		wlfw_next_node = node; wlfw_next_port = port;
+		printf("wifi: qrtr: additional WLAN service at %u:%u; queued after endpoint %u:%u\n", node, port, wlfw_node, wlfw_port);
+		return;
+	}
 	printf("wifi: qrtr: THE WI-FI FIRMWARE'S SERVICE (%#x) %s node %u port %u\n", SERVICE_WLFW, arrived ? "IS AT" : "has left",
 	    node, port);
 	wlfw_node = arrived ? node : 0;
 	wlfw_port = arrived ? port : 0;
+	if (!arrived) wlfw_ready = wlfw_msa_ready = false;
 }
 
 static void
 wlfw_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
 {
-	printf("wifi: qrtr: a datagram of %lu bytes from node %u port %u\n", (unsigned long)length, node, port);
-	memcpy(wlfw_answer_bytes, data, length < sizeof(wlfw_answer_bytes) ? length : sizeof(wlfw_answer_bytes));
+	const uint8_t *bytes = data;
+	if (node != wlfw_node || port != wlfw_port || length < 7 || length > sizeof(wlfw_answer_bytes) ||
+	    (size_t)(bytes[5] | bytes[6] << 8) != length - 7) return;
+	uint16_t message = bytes[3] | bytes[4] << 8;
+	if (bytes[0] == 4) {
+		printf("wifi: ICNSS indication %#x, %lu bytes\n", message, (unsigned long)length);
+		if (message == 0x21) wlfw_ready = true;
+		if (message == 0x2b) wlfw_msa_ready = true;
+		if (message == 0x39 && length <= 151) {
+			char text[433] = "";
+			for (size_t i = 7; i < length; i++) snprintf(text + 3 * (i - 7), 4, " %02x", bytes[i]);
+			printf("wifi: ICNSS recovery reason TLVs:%s\n", text);
+			wlfw_rejuvenating = true;
+		}
+		return;
+	}
+	if (bytes[0] != 2 || (wlfw_expected && (message != wlfw_expected || (bytes[1] | bytes[2] << 8) != wlfw_transaction))) return;
+	memcpy(wlfw_answer_bytes, data, length);
+	settle();
 	wlfw_answer = (uint32_t)length;
+}
+
+#define RMTFS_BYTES 0x300000u
+static struct {
+	struct hakios_qrtr_port *port;
+	vm_offset_t memory, permission_page;
+	uint64_t physical;
+	bool granted;
+	struct { uint8_t *data; uint32_t size; bool open; } files[4];
+	uint32_t reads, writes;
+} rmtfs;
+
+#define VM_HLOS (1u << 3)
+#define VM_MSS  (1u << 15)
+#define VM_WLAN (1u << 24)
+#define VM_CE   (1u << 25)
+
+/* qcom_scm_assign_mem: bounded source/destination lists, using the same SCM metadata for cleanup. */
+static bool
+scm_memory_permission(uint64_t address, uint32_t size, uint32_t source_mask, uint32_t dest_mask, uint32_t permissions)
+{
+	vm_offset_t page = rmtfs.permission_page;
+	uint64_t answer = ~0ull;
+	struct permission { uint32_t vmid, perm; uint64_t context; uint32_t context_size, unused; };
+	uint32_t sources = 0, destinations = 0;
+	const uint32_t allowed = VM_HLOS | VM_MSS | VM_WLAN | VM_CE;
+
+	if (!address || !size || (address & 4095) || (size & 4095) || address > UINT64_MAX - size ||
+	    !source_mask || !dest_mask || ((source_mask | dest_mask) & ~allowed) || (permissions != 6 && permissions != 7)) return false;
+	if (!page && kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return false;
+	rmtfs.permission_page = page;
+	uint64_t *region = (void *)page, *extra = (void *)(page + 256);
+	uint32_t *source = (void *)(page + 64);
+	struct permission *dest = (void *)(page + 128);
+	uint64_t physical = kvtophys(page);
+
+	for (uint32_t vmid = 0; vmid < 32; vmid++) {
+		if (source_mask & (1u << vmid)) {
+			if (sources == 3) return false;
+			source[sources++] = vmid;
+		}
+		if (dest_mask & (1u << vmid)) {
+			if (destinations == 3) return false;
+			dest[destinations++] = (struct permission){ .vmid = vmid, .perm = permissions };
+		}
+	}
+	region[0] = address; region[1] = size;
+	extra[0] = sources * sizeof(*source); extra[1] = physical + 128;
+	extra[2] = destinations * sizeof(*dest); extra[3] = 0;
+	for (vm_offset_t at = page; at < page + PAGE_SIZE; at += 64) __asm__ volatile ("dc civac, %0" : : "r" (at));
+	settle();
+	int32_t result = scm("to change shared RAM ownership", SCM_CALL(12, 0x16), 0x1117, physical, 16, physical + 64,
+	    physical + 256, &answer);
+	printf("wifi: RAM %#llx + %#x ownership %#x -> %#x: result %d, answer %#llx\n", address, size, source_mask, dest_mask, result, answer);
+	return result == 0 && answer == 0;
+}
+
+static bool
+mpss_storage_permission(bool grant)
+{
+	return scm_memory_permission(rmtfs.physical, RMTFS_BYTES, grant ? VM_HLOS : VM_HLOS | VM_MSS,
+	           grant ? VM_HLOS | VM_MSS : VM_HLOS, 6);
+}
+
+static void
+mpss_storage_stop(void)
+{
+	if (!rmtfs.granted) return;
+	if (mpss_storage_permission(false)) rmtfs.granted = false;
+	printf("wifi: RMTFS RAM-only sectors read %u, written %u; no block writes\n", rmtfs.reads, rmtfs.writes);
+}
+
+/* QMI TLVs must cover the payload exactly and each requested field must occur once. */
+static const uint8_t *
+qmi_field(const uint8_t *data, size_t length, uint8_t type, size_t *size)
+{
+	const uint8_t *found = NULL;
+	*size = 0;
+	for (size_t at = 7; at < length;) {
+		if (length - at < 3) goto invalid;
+		size_t bytes = data[at + 1] | data[at + 2] << 8;
+		if (bytes > length - at - 3) goto invalid;
+		if (data[at] == type) {
+			if (found) goto invalid;
+			found = data + at + 3; *size = bytes;
+		}
+		at += 3 + bytes;
+	}
+	return found;
+invalid:
+	*size = (size_t)-1;
+	return NULL;
+}
+
+static uint32_t
+qmi_number(const void *data)
+{
+	uint32_t value;
+	memcpy(&value, data, sizeof(value));
+	return value;
+}
+
+static void
+mpss_storage_request(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *bytes = data, *field;
+	size_t size = 0, reply_size = 14;
+	uint8_t reply[32] = { 2, 0, 0, 0, 0, 7, 0, 2, 4, 0, 1, 0, 2, 0 };
+	uint32_t id = 0, message;
+	bool good = false;
+
+	if (node != qrtr_peer || !rmtfs.port || length < 7 || bytes[0] != 0 ||
+	    (size_t)(bytes[5] | bytes[6] << 8) != length - 7) return;
+	memcpy(reply + 1, bytes + 1, 4);
+	message = bytes[3] | bytes[4] << 8;
+	field = qmi_field(bytes, length, 1, &size);
+	if (field && message == 1) {
+		static const char *const paths[] = { "/boot/modem_fs1", "/boot/modem_fs2", "/boot/modem_fsg", "/boot/modem_fsc" };
+		for (unsigned i = 0; i < 4; i++) {
+			if (size != strlen(paths[i]) || memcmp(field, paths[i], size) || !rmtfs.files[i].data) continue;
+			id = i + 1; rmtfs.files[i].open = true;
+			reply[14] = 16; reply[15] = 4;
+			memcpy(reply + 17, &id, 4); reply_size = 21;
+			good = true;
+			printf("wifi: RMTFS opened RAM snapshot %s, %u bytes\n", paths[i], rmtfs.files[i].size);
+		}
+	} else if (field && size == 4 && (id = qmi_number(field)) >= 1 && id <= 4 && rmtfs.files[id - 1].open) {
+		if (message == 2) {
+			rmtfs.files[id - 1].open = false; good = true;
+		} else if (message == 4) {
+			field = qmi_field(bytes, length, 2, &size);
+			if (field && size == 4 && qmi_number(field) > 0 && qmi_number(field) <= RMTFS_BYTES && rmtfs.granted) {
+				reply[14] = 16; reply[15] = 8;
+				memcpy(reply + 17, &rmtfs.physical, 8); reply_size = 25; good = true;
+			}
+		} else if (message == 5) {
+			reply[14] = 16; reply[15] = 1; reply_size = 18; good = true;
+		} else if (message == 3) {
+			const uint8_t *direction = qmi_field(bytes, length, 2, &size);
+			bool valid = direction && size == 1 && *direction <= 1;
+			const uint8_t *vectors = qmi_field(bytes, length, 3, &size);
+			valid = valid && vectors && size >= 1 && size == 1u + 12u * vectors[0] && vectors[0] != 0 && rmtfs.granted;
+			const uint8_t *force = qmi_field(bytes, length, 4, &size);
+			valid = valid && force && size == 1 && *force <= 1;
+			if (valid) {
+				for (unsigned i = 0; i < vectors[0]; i++) {
+					const uint8_t *v = vectors + 1 + 12 * i;
+					uint64_t offset = (uint64_t)qmi_number(v) * 512, address = qmi_number(v + 4);
+					uint64_t count = (uint64_t)qmi_number(v + 8) * 512;
+					if (offset > rmtfs.files[id - 1].size || count > rmtfs.files[id - 1].size - offset ||
+					    address < rmtfs.physical || address - rmtfs.physical > RMTFS_BYTES ||
+					    count > RMTFS_BYTES - (address - rmtfs.physical)) { valid = false; break; }
+				}
+			}
+			if (valid) {
+				settle();
+				for (unsigned i = 0; i < vectors[0]; i++) {
+					const uint8_t *v = vectors + 1 + 12 * i;
+					uint32_t sector = qmi_number(v), count = qmi_number(v + 8);
+					void *shared = (void *)(rmtfs.memory + qmi_number(v + 4) - rmtfs.physical);
+					void *snapshot = rmtfs.files[id - 1].data + (uint64_t)sector * 512;
+					if (*direction) { memcpy(snapshot, shared, (size_t)count * 512); rmtfs.writes += count; }
+					else { memcpy(shared, snapshot, (size_t)count * 512); rmtfs.reads += count; }
+				}
+				settle(); good = true;
+			}
+		}
+	}
+	if (good) { reply[10] = reply[12] = 0; }
+	else printf("wifi: RMTFS rejected message %#x for caller %u, %lu bytes\n", message, id, (unsigned long)length);
+	reply[5] = (uint8_t)(reply_size - 7);
+	qrtr_send(rmtfs.port, node, port, reply, reply_size);
+}
+
+static bool
+mpss_storage_prepare(void)
+{
+	static const char *const files[] = { "nv-modemst1", "nv-modemst2", "nv-fsg", "nv-fsc" };
+	uint64_t pool_bytes = 0;
+	const uint8_t *pool = image_file("0-rmtfs-ram", &pool_bytes);
+	vm_offset_t cached = ((vm_offset_t)pool + PAGE_MASK) & ~PAGE_MASK;
+	cached += PAGE_SIZE;
+
+	for (unsigned i = 0; i < 4; i++) {
+		uint64_t size = 0;
+		const uint8_t *data = image_file(files[i], &size);
+		uint32_t expected = i == 3 ? 0x40000 : 0x800000;
+		if (!data || size != expected || !(rmtfs.files[i].data = kalloc_data(size, Z_WAITOK))) return false;
+		memcpy(rmtfs.files[i].data, data, size); rmtfs.files[i].size = (uint32_t)size;
+	}
+	/* The loader owns the static RAM image; this plain file reserves DMA pages below 4 GiB without borrowing firmware RAM. */
+	if (!pool || pool_bytes < RMTFS_BYTES + 3 * PAGE_SIZE || cached < (vm_offset_t)pool ||
+	    cached - (vm_offset_t)pool > pool_bytes - RMTFS_BYTES - PAGE_SIZE) return false;
+	rmtfs.physical = kvtophys(cached);
+	if (rmtfs.physical > UINT32_MAX - RMTFS_BYTES || (rmtfs.physical & PAGE_MASK)) return false;
+	for (vm_offset_t offset = 0; offset < RMTFS_BYTES; offset += PAGE_SIZE) {
+		if (kvtophys(cached + offset) != rmtfs.physical + offset) return false;
+	}
+	for (vm_offset_t at = cached; at < cached + RMTFS_BYTES; at += 64) __asm__ volatile ("dc civac, %0" : : "r" (at));
+	settle();
+	rmtfs.memory = ml_io_map_unmappable(rmtfs.physical, RMTFS_BYTES, VM_WIMG_WCOMB);
+	if (!rmtfs.memory) return false;
+	bzero((void *)rmtfs.memory, RMTFS_BYTES);
+	settle();
+	printf("wifi: RMTFS reserved RAM: physical %#llx, %u bytes; grant before MPSS start\n", rmtfs.physical, RMTFS_BYTES);
+	if (!mpss_storage_permission(true)) return false;
+	rmtfs.granted = true;
+	return true;
+}
+
+static bool
+mpss_storage_start(void)
+{
+	if (!rmtfs.granted) return false;
+	rmtfs.port = qrtr_open(mpss_storage_request, NULL, NULL);
+	if (!rmtfs.port) { mpss_storage_stop(); return false; }
+	struct qrtr_control publish = { .command = QRTR_NEW_SERVER, .words = { 14, 1, QRTR_US, rmtfs.port->number } };
+	printf("wifi: RMTFS RAM-only server at %u:%u, shared %#llx, 4 private snapshots; no disk writes\n",
+	    QRTR_US, rmtfs.port->number, rmtfs.physical);
+	return qrtr_out_packet(QRTR_NEW_SERVER, QRTR_CONTROL, qrtr_peer, QRTR_CONTROL, &publish, sizeof(publish)) == 0;
+}
+
+/* Firmware transfer over QRTR, as tqftpserv; only this board's WLAN image is exported. */
+static struct hakios_qrtr_port *tftp_port;
+static struct tftp_reader {
+	struct hakios_qrtr_port *port;
+	uint32_t node, remote, block_size, window, acked, sent;
+	uint64_t offset, size;
+	const uint8_t *data;
+	bool last, writing;
+} tftp_readers[4];
+static uint8_t tftp_check[4096];
+static uint32_t tftp_check_size;
+static bool tftp_check_exists;
+
+static void
+tftp_error(struct hakios_qrtr_port *port, uint32_t node, uint32_t remote, uint8_t error)
+{
+	const uint8_t message[] = { 0, 5, 0, error, 'u', 'n', 'a', 'v', 'a', 'i', 'l', 'a', 'b', 'l', 'e', 0 };
+	qrtr_send(port, node, remote, message, sizeof(message));
+}
+
+static void
+tftp_data(void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	struct tftp_reader *reader = context;
+	const uint8_t *bytes = data;
+	uint8_t *packet;
+
+	if (node != reader->node || port != reader->remote || length < 4 || bytes[0] != 0) return;
+	if (bytes[1] == 5) {
+		printf("wifi: TFTP transfer ended by peer: code %u\n", bytes[2] << 8 | bytes[3]);
+		qrtr_close(reader->port); reader->port = NULL; return;
+	}
+	if (reader->writing) {
+		if (bytes[1] != 3 || length - 4 > reader->block_size) return;
+		uint32_t block = bytes[2] << 8 | bytes[3];
+		if (block == reader->sent + 1) {
+			uint64_t at = (uint64_t)(block - 1) * reader->block_size;
+			if (at > sizeof(tftp_check) || length - 4 > sizeof(tftp_check) - at) {
+				tftp_error(reader->port, node, port, 3); qrtr_close(reader->port); reader->port = NULL; return;
+			}
+			memcpy(tftp_check + at, bytes + 4, length - 4);
+			tftp_check_size = (uint32_t)(at + length - 4);
+			reader->sent = block; reader->last = length - 4 < reader->block_size;
+		} else if (block > reader->sent) return;
+		uint8_t ack[] = { 0, 4, (uint8_t)(reader->sent >> 8), (uint8_t)reader->sent };
+		qrtr_send(reader->port, node, port, ack, sizeof(ack));
+		if (reader->last) {
+			tftp_check_exists = true;
+			printf("wifi: TFTP server_check saved %u bytes in RAM\n", tftp_check_size);
+			qrtr_close(reader->port); reader->port = NULL;
+		}
+		return;
+	}
+	if (bytes[1] != 4 || length != 4) return;
+	uint32_t ack = bytes[2] << 8 | bytes[3];
+	if (ack < reader->acked || ack > reader->sent) return;
+	if (reader->last && ack == reader->sent) {
+		printf("wifi: TFTP WLAN image transfer complete: %llu bytes\n", reader->size);
+		qrtr_close(reader->port); reader->port = NULL; return;
+	}
+	reader->acked = ack;
+	packet = kalloc_data(reader->block_size + 4, Z_WAITOK);
+	if (!packet) return;
+	for (uint32_t n = 0; n < reader->window; n++) {
+		uint32_t block = ack + n + 1;
+		uint64_t at = (uint64_t)(block - 1) * reader->block_size;
+		if (block > 65535 || at > reader->size) break;
+		uint32_t size = (uint32_t)((reader->size - at) < reader->block_size ? reader->size - at : reader->block_size);
+		packet[0] = 0; packet[1] = 3; packet[2] = (uint8_t)(block >> 8); packet[3] = (uint8_t)block;
+		memcpy(packet + 4, reader->data + reader->offset + at, size);
+		if (qrtr_send(reader->port, node, port, packet, size + 4) != 0) break;
+		reader->sent = block;
+		reader->last = size < reader->block_size;
+		if (reader->last) break;
+	}
+	kfree_data(packet, reader->block_size + 4);
+}
+
+static void
+tftp_request(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *bytes = data;
+	char fields[14][160];
+	unsigned count = 0;
+	uint64_t file_size = 0, seek = 0, rsize = 0, write_size = 0;
+	bool writing;
+	uint32_t block_size = 512, window = 1, timeout = 1000, options = 0;
+	struct tftp_reader *reader = NULL;
+	const uint8_t *file;
+	uint8_t oack[256] = { 0, 6 };
+	size_t used = 2;
+
+	if (node != qrtr_peer || length < 4 || bytes[0] != 0) return;
+	writing = bytes[1] == 2;
+	if (bytes[1] != 1 && !writing) { tftp_error(tftp_port, node, port, 2); return; }
+	for (size_t at = 2; at < length;) {
+		size_t size = strnlen((const char *)bytes + at, length - at);
+		if (size == length - at || size >= sizeof(fields[0]) || count == 14) goto invalid;
+		memcpy(fields[count], bytes + at, size + 1); count++; at += size + 1;
+	}
+	if (count < 2 || count % 2 || strcmp(fields[1], "octet")) goto invalid;
+	printf("wifi: TFTP %s %s, %u option pairs\n", writing ? "write" : "read", fields[0], (count - 2) / 2);
+	const char *path = fields[0] + (fields[0][0] == '/');
+	if (!strcmp(path, "readwrite/server_check.txt")) {
+		file = tftp_check; file_size = writing ? sizeof(tftp_check) : tftp_check_size;
+		if (!writing && !tftp_check_exists) { tftp_error(tftp_port, node, port, 1); return; }
+	} else if (!writing && !strcmp(path, "readonly/firmware/image/wlanmdsp.mbn")) {
+		file = image_file("wlanmdsp.mbn", &file_size);
+		if (!file || file_size == 0 || file_size > 64 * 1024 * 1024) { tftp_error(tftp_port, node, port, 1); return; }
+	} else { tftp_error(tftp_port, node, port, writing ? 2 : 1); return; }
+	for (unsigned i = 2; i < count; i += 2) {
+		static const char *const names[] = { "blksize", "wsize", "timeoutms", "tsize", "rsize", "seek" };
+		uint64_t value = 0;
+		unsigned option;
+		if (!fields[i + 1][0]) goto invalid;
+		for (const char *c = fields[i + 1]; *c; c++) {
+			if (*c < '0' || *c > '9' || value > (UINT64_MAX - (unsigned)(*c - '0')) / 10) goto invalid;
+			value = value * 10 + (unsigned)(*c - '0');
+		}
+		for (option = 0; option < 6 && strcmp(fields[i], names[option]); option++);
+		if (option == 6 || (options & (1u << option))) goto invalid;
+		options |= 1u << option;
+		switch (option) {
+		case 0: if (value < 8 || value > 65464) goto invalid; block_size = value > 7680 ? 7680 : (uint32_t)value; break;
+		case 1: if (value < 1 || value > 65535) goto invalid; window = value > 10 ? 10 : (uint32_t)value; break;
+		case 2: if (value < 1 || value > 255000) goto invalid; timeout = (uint32_t)value; break;
+		case 3: if ((!writing && value != 0) || (writing && value > sizeof(tftp_check))) goto invalid; write_size = value; break;
+		case 4: if (writing || value == 0 || value > file_size) goto invalid; rsize = value; break;
+		case 5: if ((writing && value != 0) || value > file_size) goto invalid; seek = value; break;
+		}
+	}
+	if ((rsize && rsize > file_size - seek) || (rsize ? rsize : file_size - seek) / block_size >= 65535) goto invalid;
+	for (unsigned i = 0; i < 4; i++) {
+		if (tftp_readers[i].port && tftp_readers[i].node == node && tftp_readers[i].remote == port) {
+			qrtr_close(tftp_readers[i].port); tftp_readers[i].port = NULL;
+		}
+		if (!tftp_readers[i].port && !reader) reader = &tftp_readers[i];
+	}
+	if (!reader) { tftp_error(tftp_port, node, port, 0); return; }
+	*reader = (struct tftp_reader){ .node = node, .remote = port, .block_size = block_size, .window = window,
+	    .offset = seek, .size = rsize ? rsize : file_size - seek, .data = file, .writing = writing };
+	if (writing) { reader->window = 1; window = 1; tftp_check_exists = false; tftp_check_size = 0; }
+	reader->port = qrtr_open(tftp_data, NULL, reader);
+	if (!reader->port) return;
+	if (options) {
+		static const char *const names[] = { "blksize", "wsize", "timeoutms", "tsize", "rsize", "seek" };
+		uint64_t values[] = { block_size, window, timeout, writing ? write_size : file_size, rsize, seek };
+		for (unsigned i = 0; i < 6; i++) {
+			if (!(options & (1u << i))) continue;
+			int n = snprintf((char *)oack + used, sizeof(oack) - used, "%s", names[i]);
+			if (n < 0 || (size_t)n >= sizeof(oack) - used) goto failed;
+			used += (size_t)n + 1;
+			n = snprintf((char *)oack + used, sizeof(oack) - used, "%llu", (unsigned long long)values[i]);
+			if (n < 0 || (size_t)n >= sizeof(oack) - used) goto failed;
+			used += (size_t)n + 1;
+		}
+		if (qrtr_send(reader->port, node, port, oack, used) != 0) goto failed;
+	} else {
+		const uint8_t ack[] = { 0, 4, 0, 0 };
+		if (writing) qrtr_send(reader->port, node, port, ack, sizeof(ack));
+		else tftp_data(reader, node, port, ack, sizeof(ack));
+	}
+	return;
+failed:
+	qrtr_close(reader->port); reader->port = NULL;
+	return;
+invalid:
+	tftp_error(tftp_port, node, port, 8);
+}
+
+static bool
+tftp_start(void)
+{
+	tftp_port = qrtr_open(tftp_request, NULL, NULL);
+	if (!tftp_port) return false;
+	struct qrtr_control publish = { .command = QRTR_NEW_SERVER, .words = { 4096, 1, QRTR_US, tftp_port->number } };
+	return qrtr_out_packet(QRTR_NEW_SERVER, QRTR_CONTROL, qrtr_peer, QRTR_CONTROL, &publish, sizeof(publish)) == 0;
+}
+
+/* Native diagfwd_socket: APPS publishes modem control instance 0 and data instance 2. */
+static struct { struct hakios_qrtr_port *port; uint32_t remote; unsigned packets; bool configured; } mpss_diag[2];
+static char mpss_diag_names[8][30];
+
+static void
+mpss_microdump(const char *stage)
+{
+	uint32_t size = 0, offset = smem_item(611, &size);
+	if (!offset || !size || size > 4096) return;
+	printf("wifi: MPSS microdump %s: SMEM 611, %u bytes (may contain prior state)\n", stage, size);
+	for (uint32_t at = 0; at < size; at += 16) {
+		uint32_t words[4] = { 0 };
+		uint32_t bytes = size - at < 16 ? size - at : 16;
+		if (!smem_peek(offset + at, words, bytes)) return;
+		printf("wifi: SMEM611 +%#x: %08x %08x %08x %08x\n", at, words[0], words[1], words[2], words[3]);
+	}
+}
+
+static void
+mpss_diag_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	unsigned channel = (unsigned)(uintptr_t)context;
+	const uint8_t *bytes = data;
+	static const uint8_t mask[] = { 11, 0, 0, 0, 15, 0, 0, 0, 1, 2, 0, 0, 0, 0xff, 0xff, 1, 0, 0, 0,
+	    0x18, 0, 0, 0 };
+	if (channel >= 2 || node != qrtr_peer || !length || length > 0x4400 || !mpss_diag[channel].port ||
+	    (mpss_diag[channel].remote && mpss_diag[channel].remote != port)) return;
+	mpss_diag[channel].remote = port;
+	if (mpss_diag[channel].packets++ < 12) {
+		char text[193] = "";
+		for (size_t i = 0; i < length && i < 64; i++) snprintf(text + 3 * i, 4, " %02x", bytes[i]);
+		printf("wifi: MPSS DIAG %s %lu bytes:%s\n", channel ? "data" : "control", (unsigned long)length, text);
+	}
+	if (channel == 0) {
+		/* A control datagram can contain several length-prefixed records. */
+		for (size_t at = 0; length - at >= 8;) {
+			uint32_t command = qmi_number(bytes + at), size = qmi_number(bytes + at + 4);
+			if (size > length - at - 8) return;
+			if (command == 8 && size >= 5 && !mpss_diag[0].configured) {
+				uint32_t count = qmi_number(bytes + at + 8);
+				if (!count || count > size - 4) return;
+				const uint8_t feature[] = { 8, 0, 0, 0, 6, 0, 0, 0, 2, 0, 0, 0, 0x41, 0xa8 };
+				const uint32_t realtime[] = { 3, 36, 1, 1, 1, 0, 0, 0, 0, 0, 0 };
+				int error = qrtr_send(mpss_diag[0].port, node, port, feature, sizeof(feature));
+				if (!error) error = qrtr_send(mpss_diag[0].port, node, port, mask, sizeof(mask));
+				if (!error) error = qrtr_send(mpss_diag[0].port, node, port, realtime, sizeof(realtime));
+				mpss_diag[0].configured = error == 0;
+				printf("wifi: MPSS DIAG fatal/error realtime setup at %u:%u: send %d\n", node, port, error);
+			} else if (command == 33 && size > 8 && size <= 38 && qmi_number(bytes + at + 8) == 1) {
+				const char *name = (const char *)bytes + at + 16;
+				size_t name_size = size - 8;
+				if (strnlen(name, name_size) != name_size - 1 || name_size == 1) return;
+				for (size_t i = 0; i + 1 < name_size; i++) if (name[i] < 32 || name[i] > 126) return;
+				unsigned id;
+				for (id = 0; id < 8 && mpss_diag_names[id][0] && strcmp(mpss_diag_names[id], name); id++) { }
+				if (id == 8) return;
+				memcpy(mpss_diag_names[id], name, name_size);
+				uint8_t reply[46] = { 33, 0, 0, 0, (uint8_t)size, 0, 0, 0, 1, 0, 0, 0, (uint8_t)(id + 2), 0, 0, 0 };
+				memcpy(reply + 16, name, name_size);
+				uint8_t realtime[45] = { 3, 0, 0, 0, 37, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 1 };
+				realtime[44] = (uint8_t)(id + 2);
+				int error = qrtr_send(mpss_diag[0].port, node, port, reply, 8 + size);
+				if (!error) error = qrtr_send(mpss_diag[0].port, node, port, mask, sizeof(mask));
+				if (!error) error = qrtr_send(mpss_diag[0].port, node, port, realtime, sizeof(realtime));
+				printf("wifi: MPSS DIAG process %s -> ID %u: send %d\n", mpss_diag_names[id], id + 2, error);
+			}
+			at += 8 + size;
+		}
+	}
+	if (channel == 1 && mpss_diag[1].packets <= 128) {
+		for (size_t at = 0, shown = 0; at < length && shown < 8;) {
+			char text[193]; size_t start = at, used = 0;
+			while (at < length && bytes[at] >= 32 && bytes[at] <= 126) {
+				if (used < sizeof(text) - 1) text[used++] = bytes[at];
+				at++;
+			}
+			if (at < length) at++;
+			text[used] = 0;
+			if (used >= 8) { printf("wifi: MPSS DIAG text +%lu: %s\n", (unsigned long)start, text); shown++; }
+		}
+	}
+}
+
+static bool
+mpss_diag_start(void)
+{
+	bzero(mpss_diag, sizeof(mpss_diag));
+	bzero(mpss_diag_names, sizeof(mpss_diag_names));
+	for (unsigned i = 0; i < 2; i++) {
+		mpss_diag[i].port = qrtr_open(mpss_diag_receive, NULL, (void *)(uintptr_t)i);
+		if (!mpss_diag[i].port) goto fail;
+		struct qrtr_control publish = { .command = QRTR_NEW_SERVER,
+		    .words = { 0x1001, i ? 2 : 0, QRTR_US, mpss_diag[i].port->number } };
+		if (qrtr_out_packet(QRTR_NEW_SERVER, QRTR_CONTROL, qrtr_peer, QRTR_CONTROL, &publish, sizeof(publish))) goto fail;
+	}
+	return true;
+fail:
+	for (unsigned i = 0; i < 2; i++) if (mpss_diag[i].port) qrtr_close(mpss_diag[i].port);
+	bzero(mpss_diag, sizeof(mpss_diag));
+	return false;
+}
+
+static struct hakios_qrtr_port *pd_mapper_port;
+
+/* Domains from this phone's firmware *.jsn; these describe locations, not whether a DSP is running. */
+static void
+pd_mapper_request(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	static const struct { const char *service, *domain; uint32_t instance; } domains[] = {
+		{ "tms/servreg", "msm/adsp/root_pd", 74 },
+		{ "tms/servreg", "msm/adsp/audio_pd", 74 },
+		{ "avs/audio", "msm/adsp/audio_pd", 74 },
+		{ "tms/servreg", "msm/cdsp/root_pd", 76 },
+		{ "tms/servreg", "msm/modem/root_pd", 180 },
+		{ "tms/pdr_enabled", "msm/modem/root_pd", 180 },
+		{ "gps/gps_service", "msm/modem/root_pd", 180 },
+		{ "kernel/elf_loader", "msm/modem/wlan_pd", 180 },
+		{ "tms/servreg", "msm/modem/wlan_pd", 180 },
+		{ "wlan/fw", "msm/modem/wlan_pd", 180 },
+		{ "tms/servreg", "msm/slpi/root_pd", 90 },
+		{ "tms/servreg", "msm/slpi/sensor_pd", 90 },
+	};
+	const uint8_t *bytes = data, *name, *offset;
+	uint8_t reply[1024] = { 2, 0, 0, 0, 0, 7, 0, 2, 4, 0, 1, 0, 2, 0 };
+	size_t size = 0, name_size = 0, used = 14, list_at;
+	uint32_t first = 0;
+	uint16_t total = 0;
+	unsigned count = 0;
+
+	if (node != qrtr_peer || !pd_mapper_port || length < 7 || bytes[0] != 0 ||
+	    (size_t)(bytes[5] | bytes[6] << 8) != length - 7) return;
+	memcpy(reply + 1, bytes + 1, 4);
+	if (bytes[3] != 0x21 || bytes[4] != 0) goto respond;
+	name = qmi_field(bytes, length, 1, &name_size);
+	offset = qmi_field(bytes, length, 0x10, &size);
+	if (!name || name_size == 0 || name_size > 64 || strnlen((const char *)name, name_size) != name_size ||
+	    (!offset && size == (size_t)-1) || (offset && size != 4)) goto respond;
+	if (offset) first = qmi_number(offset);
+	for (unsigned i = 0; i < sizeof(domains) / sizeof(domains[0]); i++) {
+		if (strlen(domains[i].service) == name_size && memcmp(domains[i].service, name, name_size) == 0) total++;
+	}
+	reply[10] = reply[12] = 0;
+	reply[used++] = 0x10; reply[used++] = 2; reply[used++] = 0;
+	memcpy(reply + used, &total, 2); used += 2;
+	reply[used++] = 0x11; reply[used++] = 2; reply[used++] = 0; reply[used++] = 1; reply[used++] = 0;
+	list_at = used;
+	reply[used++] = 0x12; reply[used++] = 1; reply[used++] = 0; reply[used++] = 0;
+	for (unsigned i = 0, matched = 0; i < sizeof(domains) / sizeof(domains[0]); i++) {
+		if (strlen(domains[i].service) != name_size || memcmp(domains[i].service, name, name_size) != 0) continue;
+		if (matched++ < first) continue;
+		size_t domain_size = strlen(domains[i].domain);
+		if (used + 10 + domain_size > sizeof(reply)) break;
+		reply[used++] = (uint8_t)domain_size;
+		memcpy(reply + used, domains[i].domain, domain_size); used += domain_size;
+		memcpy(reply + used, &domains[i].instance, 4); used += 4;
+		memset(reply + used, 0, 5); used += 5; count++;
+	}
+	if (count == 0) used = list_at;
+	else {
+		reply[list_at + 3] = (uint8_t)count;
+		uint16_t list_size = (uint16_t)(used - list_at - 3);
+		memcpy(reply + list_at + 1, &list_size, 2);
+	}
+	printf("wifi: PD mapper lookup %.*s: %u domains, offset %u, returned %u\n", (int)name_size, name, total, first, count);
+respond:
+	uint16_t payload_size = (uint16_t)(used - 7);
+	memcpy(reply + 5, &payload_size, 2);
+	qrtr_send(pd_mapper_port, node, port, reply, used);
+}
+
+#define WLAN_DOMAIN "msm/modem/wlan_pd"
+static struct { struct hakios_qrtr_port *port; uint32_t node, remote; } wlan_pdr;
+
+static void
+wlan_pdr_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *bytes = data, *state, *name, *transaction;
+	size_t size = 0;
+	if (node != wlan_pdr.node || port != wlan_pdr.remote || length < 7 ||
+	    (size_t)(bytes[5] | bytes[6] << 8) != length - 7 || bytes[4] != 0) return;
+	if (bytes[0] == 2) {
+		const uint8_t *result = qmi_field(bytes, length, 2, &size);
+		if (!result || size != 4) return;
+		printf("wifi: WLAN PDR response %#x: result %u, error %u\n", bytes[3], result[0] | result[1] << 8, result[2] | result[3] << 8);
+		state = qmi_field(bytes, length, 0x10, &size);
+		if (state && size == 4) printf("wifi: WLAN protection domain state %#x\n", qmi_number(state));
+		return;
+	}
+	if (bytes[0] != 4 || bytes[3] != 0x22) return;
+	state = qmi_field(bytes, length, 1, &size);
+	if (!state || size != 4) return;
+	uint32_t value = qmi_number(state);
+	name = qmi_field(bytes, length, 2, &size);
+	if (!name || size != sizeof(WLAN_DOMAIN) - 1 || memcmp(name, WLAN_DOMAIN, size)) return;
+	transaction = qmi_field(bytes, length, 3, &size);
+	if (!transaction || size != 2) return;
+	printf("wifi: WLAN protection domain state changed to %#x\n", value);
+	uint8_t ack[64] = { 0, 2, 0, 0x23, 0, 0, 0, 1, sizeof(WLAN_DOMAIN) - 1, 0 };
+	memcpy(ack + 10, WLAN_DOMAIN, sizeof(WLAN_DOMAIN) - 1);
+	size_t used = 10 + sizeof(WLAN_DOMAIN) - 1;
+	ack[used++] = 2; ack[used++] = 2; ack[used++] = 0;
+	memcpy(ack + used, transaction, 2); used += 2; ack[5] = (uint8_t)(used - 7);
+	qrtr_send(wlan_pdr.port, node, port, ack, used);
+}
+
+static void
+wlan_pdr_service(__unused void *context, bool arrived, uint32_t service, uint32_t version, uint32_t instance, uint32_t node, uint32_t port)
+{
+	if (!arrived || service != 0x42 || version != 1 || instance != 180) return;
+	wlan_pdr.node = node; wlan_pdr.remote = port;
+	uint8_t request[64] = { 0, 1, 0, 0x20, 0, 0, 0, 1, 1, 0, 1, 2, sizeof(WLAN_DOMAIN) - 1, 0 };
+	memcpy(request + 14, WLAN_DOMAIN, sizeof(WLAN_DOMAIN) - 1);
+	size_t length = 14 + sizeof(WLAN_DOMAIN) - 1; request[5] = (uint8_t)(length - 7);
+	printf("wifi: subscribe to WLAN protection domain at %u:%u: send %d\n", node, port,
+	    qrtr_send(wlan_pdr.port, node, port, request, length));
+}
+
+static void
+wlan_pdr_start(void)
+{
+	wlan_pdr.port = qrtr_open(wlan_pdr_receive, wlan_pdr_service, NULL);
+	if (wlan_pdr.port) qrtr_lookup(wlan_pdr.port, 0x42, 1, 180);
+}
+
+static void
+pd_mapper_start(void)
+{
+	pd_mapper_port = qrtr_open(pd_mapper_request, NULL, NULL);
+	if (!pd_mapper_port) return;
+	struct qrtr_control publish = { .command = QRTR_NEW_SERVER,
+	    .words = { 64, 0x101, QRTR_US, pd_mapper_port->number } };
+	qrtr_out_packet(QRTR_NEW_SERVER, QRTR_CONTROL, qrtr_peer, QRTR_CONTROL, &publish, sizeof(publish));
+}
+
+static bool
+icnss_call(struct hakios_qrtr_port *port, uint16_t message, const void *body, uint16_t length)
+{
+	uint8_t *request;
+	size_t size = 0;
+	if (length > 6272 || !(request = kalloc_data(length + 7, Z_WAITOK | Z_ZERO))) return false;
+	wlfw_expected = message; wlfw_transaction++; wlfw_answer = 0;
+	memcpy(request + 1, &wlfw_transaction, 2); memcpy(request + 3, &message, 2); memcpy(request + 5, &length, 2);
+	if (length) memcpy(request + 7, body, length);
+	settle();
+	int error = qrtr_send(port, wlfw_node, wlfw_port, request, length + 7);
+	kfree_data(request, length + 7);
+	uint64_t until = now_us() + 3000000;
+	while (!error && !wlfw_answer && now_us() < until) sleep_us(1000);
+	if (error || !wlfw_answer) {
+		printf("wifi: ICNSS request %#x failed: send %d, reply %u\n", message, error, wlfw_answer); return false;
+	}
+	settle();
+	const uint8_t *result = qmi_field(wlfw_answer_bytes, wlfw_answer, 2, &size);
+	if (!result || size != 4) return false;
+	printf("wifi: ICNSS response %#x: result %u, error %u\n", message, result[0] | result[1] << 8, result[2] | result[3] << 8);
+	return result[0] == 0 && result[1] == 0 && result[2] == 0 && result[3] == 0;
+}
+
+static void
+icnss_rail_status(void)
+{
+	static const uint16_t peripherals[] = { 0x140, 0x146, 0x541, 0x549, 0x54a };
+	uint32_t version = get(&arb_core, "version", ARB_VERSION);
+	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) return;
+	arb_channels = get(&arb_core, "channels", ARB_FEATURES) & 0x7ff;
+	if (arb_channels == 0 || arb_channels > 512) arb_channels = 512;
+	need(&arb_cnfg); need(&arb_observer);
+	for (unsigned i = 0; i < sizeof(peripherals) / sizeof(peripherals[0]); i++) {
+		int channel = spmi_channel(peripherals[i]);
+		uint8_t status = 0, control[8] = { 0 };
+		const char *problem = "no channel";
+		if (channel >= 0) {
+			hakios_spmi_lock();
+			problem = spmi_read(channel, 0x08, &status, 1);
+			if (!problem) problem = spmi_read(channel, 0x40, control, 8);
+			hakios_spmi_unlock();
+		}
+		if (problem) printf("wifi: ICNSS rail %#x readback: %s\n", peripherals[i], problem);
+		else printf("wifi: ICNSS rail %#x: enabled %u, status %#x, requested %u mV, actual %u mV, mode %#x\n",
+		    peripherals[i], (control[6] >> 7) & 1, status, control[0] | control[1] << 8, control[2] | control[3] << 8, control[5]);
+	}
+}
+
+static bool icnss_rails_touched;
+static bool icnss_qdss_touched;
+static uint32_t icnss_rail_address[5];
+
+static bool
+icnss_power(bool on)
+{
+	static const char *const names[] = { "ldoa1", "ldoa7", "ldoc2", "ldoc10", "ldoc11" };
+	static const uint32_t millivolts[] = { 752, 1800, 1304, 3312, 3104 };
+	uint32_t addresses[15], values[15];
+	unsigned count = 0;
+	bool clock_done = true;
+	if (!on && icnss_qdss_touched) {
+		clock_done = mailbox_send("{class: clock, res: qdss, val: 0}");
+		if (clock_done) icnss_qdss_touched = false;
+	}
+	if (!on && !icnss_rails_touched) return clock_done;
+	for (unsigned i = 0; i < 5; i++) {
+		if (on) {
+			const struct cmd_db_entry *entry = rpmh_resource(names[i], 0);
+			if (!entry || (entry->address >> 16 & 0xf) != 4) return false;
+			icnss_rail_address[i] = entry->address;
+		}
+	}
+	for (unsigned n = 0; n < 5; n++) {
+		unsigned i = on ? n : 4 - n;
+		uint32_t base = icnss_rail_address[i];
+		if (on) {
+			addresses[count] = base; values[count++] = millivolts[i];
+			addresses[count] = base + 8; values[count++] = i == 3 ? 7 : 4; /* L10C HPM; native defaults for the other rails. */
+		}
+		addresses[count] = base + 4; values[count++] = on ? 1 : 0;
+		printf("wifi: ICNSS %s %s, %u mV\n", names[i], on ? "on" : "off", millivolts[i]);
+	}
+	icnss_rails_touched = true;
+	bool done = wifi_rpmh_write(addresses, values, count);
+	if (!on && done) icnss_rails_touched = false;
+	if (on && done) {
+		/* WCN3998 unlocks CoreSight registers during bring-up; QDSS must remain clocked. */
+		icnss_qdss_touched = true;
+		done = mailbox_send("{class: clock, res: qdss, val: 1}");
+	}
+	return done && clock_done;
+}
+
+static struct { uint64_t address; uint32_t size, owners; } icnss_regions[2];
+
+bool hakios_wifi_icnss_ready(void)
+{
+	return hakios_is_raphael() && wlfw_ready && !raphael_wlan_crashed && icnss_rails_touched && icnss_qdss_touched;
+}
+
+
+static void
+icnss_dump_strings(uint64_t address, uint32_t size)
+{
+	if (address < 0x8bc00000 || address >= 0x8bd80000 || !size || size > 0x8bd80000 - address ||
+	    (address & 4095) || (size & 4095)) return;
+	vm_offset_t mapped = ml_io_map_unmappable(address, size, VM_WIMG_WCOMB);
+	if (!mapped) return;
+	const volatile uint8_t *data = (void *)mapped;
+	printf("wifi: stopped WLAN MSA diagnostic %#llx + %#x\n", address, size);
+	for (uint32_t at = 0; at < 128 && at + 16 <= size; at += 16) {
+		const volatile uint32_t *words = (const void *)(data + at);
+		printf("wifi: MSA +%#x: %08x %08x %08x %08x\n", at, words[0], words[1], words[2], words[3]);
+	}
+	for (uint32_t at = 0, shown = 0; at < size && shown < 32;) {
+		char text[161];
+		uint32_t start = at, length = 0;
+		while (at < size && data[at] >= 32 && data[at] <= 126) {
+			if (length < sizeof(text) - 1) text[length++] = data[at];
+			at++;
+		}
+		if (at < size) at++;
+		text[length] = 0;
+		if (length >= 8 && (strnstr(text, "err", length) || strnstr(text, "ERR", length) || strnstr(text, "assert", length) ||
+		    strnstr(text, "ASSERT", length) || strnstr(text, ".c", length))) {
+			printf("wifi: MSA diagnostic +%#x: %s\n", start, text); shown++;
+		}
+	}
+	ml_io_unmap(mapped, size);
+}
+
+static void
+icnss_memory_stop(void)
+{
+	if ((icnss_rails_touched || icnss_qdss_touched) && !icnss_power(false))
+		printf("wifi: ICNSS power-off incomplete\n");
+	for (unsigned i = 0; i < 2; i++) {
+		if (icnss_regions[i].owners && scm_memory_permission(icnss_regions[i].address, icnss_regions[i].size,
+		    icnss_regions[i].owners, VM_HLOS, 7)) {
+			icnss_regions[i].owners = 0;
+			if (raphael_wlan_crashed) icnss_dump_strings(icnss_regions[i].address, icnss_regions[i].size);
+		}
+	}
+}
+
+/* Only the observed default board ID is supported here; Xiaomi's CN/GL BDF selection is separate. */
+static bool
+icnss_board_data(struct hakios_qrtr_port *port)
+{
+	uint64_t size = 0;
+	char name[32] = { 0 };
+	/* Xiaomi selects F11 CN/GL using Android's hwversion/hwc, independently of the QMI board ID. */
+	if (!PE_parse_boot_arg_str("wifi_bdf", name, sizeof(name)) ||
+	    (strcmp(name, "bd_f11cn.bin") && strcmp(name, "bd_f11gl.bin"))) {
+		printf("wifi: ICNSS requires this phone's native wifi_bdf=bd_f11cn.bin or bd_f11gl.bin\n"); return false;
+	}
+	const uint8_t *file = image_file(name, &size);
+	uint8_t *request;
+	bool good = false;
+	if (!file || !size || size > 128 * 1024 || !(request = kalloc_data(6208, Z_WAITOK))) return false;
+	for (uint32_t offset = 0, segment = 0; offset < size; segment++) {
+		uint16_t bytes = (uint16_t)(size - offset > 6144 ? 6144 : size - offset);
+		uint8_t valid[] = { 1, 1, 0, 1, 0x10, 4, 0, 0, 0, 0, 0 };
+		memcpy(request, valid, sizeof(valid));
+		size_t used = sizeof(valid);
+		request[used++] = 0x11; request[used++] = 4; request[used++] = 0;
+		uint32_t total = (uint32_t)size;
+		memcpy(request + used, &total, 4); used += 4;
+		request[used++] = 0x12; request[used++] = 4; request[used++] = 0;
+		memcpy(request + used, &segment, 4); used += 4;
+		request[used++] = 0x13;
+		uint16_t length = bytes + 2;
+		memcpy(request + used, &length, 2); used += 2;
+		memcpy(request + used, &bytes, 2); used += 2;
+		memcpy(request + used, file + offset, bytes); used += bytes;
+		request[used++] = 0x14; request[used++] = 1; request[used++] = 0;
+		request[used++] = offset + bytes == size;
+		request[used++] = 0x15; request[used++] = 1; request[used++] = 0; request[used++] = 0;
+		if (!icnss_call(port, 0x25, request, (uint16_t)used)) goto out;
+		offset += bytes;
+	}
+	printf("wifi: ICNSS board data %s accepted: %llu bytes\n", name, size);
+	const uint8_t calibration[] = { 1, 1, 0, 0, 0x11, 1, 0, 0 };
+	good = icnss_call(port, 0x26, calibration, sizeof(calibration));
+out:
+	kfree_data(request, 6208);
+	return good;
+}
+
+static bool
+icnss_default_board(void)
+{
+	size_t size = 0;
+	const uint8_t *board = qmi_field(wlfw_answer_bytes, wlfw_answer, 0x11, &size);
+	if ((board && (size != 4 || qmi_number(board) != 0xff)) || (!board && size == (size_t)-1)) {
+		printf("wifi: ICNSS returned a non-default board ID: default BDF refused\n"); return false;
+	}
+	return true;
+}
+
+static bool
+icnss_mac_address(struct hakios_qrtr_port *port)
+{
+	if (!icnss_mac_valid) {
+		struct sockaddr_qrtr peer = { .sq_family = AF_QIPCRTR };
+		lck_mtx_lock(&qrtr_lock);
+		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+			if (qrtr_servers[i].there && qrtr_servers[i].service == 2 && qrtr_servers[i].instance == 1) {
+				peer.sq_node = qrtr_servers[i].node; peer.sq_port = qrtr_servers[i].port; break;
+			}
+		}
+		lck_mtx_unlock(&qrtr_lock);
+		if (!peer.sq_port) { printf("wifi: DMS service is not available for WLAN address\n"); return false; }
+		struct mac_reply { struct qmi_response_type_v01 result; uint8_t valid; uint32_t length; uint8_t bytes[8]; } reply = { 0 };
+		static const struct qmi_elem_info request[] = {
+			{ QMI_UNSIGNED_4_BYTE, 1, 4, NO_ARRAY, 1, 0, NULL }, { .data_type = QMI_EOTI },
+		};
+		static const struct qmi_elem_info fields[] = {
+			{ QMI_STRUCT, 1, sizeof(struct qmi_response_type_v01), NO_ARRAY, 2, offsetof(struct mac_reply, result), qmi_response_type_v01_ei },
+			{ QMI_OPT_FLAG, 1, 1, NO_ARRAY, 0x10, offsetof(struct mac_reply, valid), NULL },
+			{ QMI_DATA_LEN, 1, 1, NO_ARRAY, 0x10, offsetof(struct mac_reply, length), NULL },
+			{ QMI_UNSIGNED_1_BYTE, 8, 1, VAR_LEN_ARRAY, 0x10, offsetof(struct mac_reply, bytes), NULL },
+			{ .data_type = QMI_EOTI },
+		};
+		struct qmi_handle handle = { 0 };
+		struct qmi_txn transaction;
+		uint32_t device = 0; /* DMS_DEVICE_MAC_WLAN. */
+		if (qmi_handle_init(&handle, 64, NULL, NULL) < 0) return false;
+		int error = qmi_txn_init(&handle, &transaction, fields, &reply);
+		if (error >= 0) {
+			error = qmi_send_request(&handle, &peer, &transaction, 0x5c, 7, request, &device);
+			if (error < 0) qmi_txn_cancel(&transaction);
+			else error = hakios_qmi_txn_wait_ms(&transaction, 3000);
+		}
+		qmi_handle_release(&handle);
+		if (error < 0 || reply.result.result || reply.result.error || !reply.valid || reply.length != sizeof(icnss_mac) ||
+		    (reply.bytes[0] & 1) || !(reply.bytes[0] | reply.bytes[1] | reply.bytes[2] | reply.bytes[3] | reply.bytes[4] | reply.bytes[5])) {
+			printf("wifi: DMS WLAN address unavailable: request %d, result %u, error %u\n", error, reply.result.result, reply.result.error);
+			return false;
+		}
+		memcpy(icnss_mac, reply.bytes, sizeof(icnss_mac)); icnss_mac_valid = true;
+		printf("wifi: DMS supplied a valid WLAN station address\n");
+	}
+	uint8_t request[9] = { 0x10, 6, 0 };
+	memcpy(request + 3, icnss_mac, sizeof(icnss_mac));
+	return icnss_call(port, 0x33, request, sizeof(request));
+}
+
+static bool icnss_smmu_prepare(void);
+static void radio_space_faults(void);
+
+static bool
+icnss_bootstrap(struct hakios_qrtr_port *port)
+{
+	unsigned handoffs = 0;
+retry:
+	wlfw_connected = true;
+	wlfw_next_port = 0;
+	const uint8_t indications[] = { 0x10, 1, 0, 1, 0x13, 1, 0, 1, 0x14, 1, 0, 1, 0x15, 4, 0, 0x4c, 0x45, 0x4e, 0x4b,
+	    0x19, 4, 0, 1, 0, 0, 0 };
+	const uint8_t msa[] = { 1, 8, 0, 0, 0, 0xc0, 0x8b, 0, 0, 0, 0, 2, 4, 0, 0, 0, 0x18, 0 };
+	size_t size = 0;
+	if (!icnss_call(port, 0x20, indications, sizeof(indications))) return false;
+	const uint8_t *status = qmi_field(wlfw_answer_bytes, wlfw_answer, 0x10, &size);
+	if (status) {
+		uint64_t flags;
+		if (size != sizeof(flags)) return false;
+		memcpy(&flags, status, sizeof(flags));
+		printf("wifi: ICNSS registration firmware status %#llx\n", flags);
+		if (flags & 2) { wlfw_ready = true; return !raphael_wlan_crashed; }
+		if (flags & 1) return false;
+	} else if (size == (size_t)-1) return false;
+	if (hakios_wifi_option("wifi_smmu") == 2 && !icnss_smmu_prepare()) return false;
+	if (!icnss_call(port, 0x2d, msa, sizeof(msa))) return false;
+	const uint8_t *regions = qmi_field(wlfw_answer_bytes, wlfw_answer, 3, &size);
+	if (!regions || size < 1 || regions[0] == 0 || regions[0] > 2 || size != 1u + 13u * regions[0]) return false;
+	for (unsigned i = 0; i < regions[0]; i++) {
+		const uint8_t *region = regions + 1 + 13 * i;
+		uint64_t address;
+		uint32_t bytes = qmi_number(region + 8);
+		memcpy(&address, region, 8);
+		if (address < 0x8bc00000 || address >= 0x8bd80000 || !bytes || bytes > 0x8bd80000 - address ||
+		    (address & 4095) || (bytes & 4095) || region[12] > 1) return false;
+		if (i && address < icnss_regions[i - 1].address + icnss_regions[i - 1].size &&
+		    address + bytes > icnss_regions[i - 1].address) return false;
+		if (icnss_regions[i].owners && (address != icnss_regions[i].address || bytes != icnss_regions[i].size)) return false;
+		icnss_regions[i].address = address; icnss_regions[i].size = bytes;
+		printf("wifi: ICNSS MSA region %u: %#llx + %#x, secure %u\n", i, address, bytes, region[12]);
+	}
+	for (unsigned i = 0; i < regions[0]; i++) {
+		uint32_t owners = VM_MSS | VM_WLAN | (regions[1 + 13 * i + 12] ? 0 : VM_CE);
+		if (icnss_regions[i].owners == owners) continue;
+		if (icnss_regions[i].owners) return false;
+		if (!scm_memory_permission(icnss_regions[i].address, icnss_regions[i].size, VM_HLOS, owners, 6)) return false;
+		icnss_regions[i].owners = owners;
+	}
+	if (!icnss_call(port, 0x2e, NULL, 0) || !icnss_call(port, 0x24, NULL, 0)) return false;
+	for (uint8_t type = 0x10; type <= 0x13; type++) {
+		const uint8_t *capability = qmi_field(wlfw_answer_bytes, wlfw_answer, type, &size);
+		if (!capability) continue;
+		char text[97] = "";
+		for (size_t i = 0; i < size && i < 32; i++) snprintf(text + 3 * i, 4, " %02x", capability[i]);
+		printf("wifi: ICNSS capability TLV %#x (%lu bytes):%s\n", type, (unsigned long)size, text);
+	}
+	if (!icnss_default_board()) return false;
+	if (!icnss_power(true)) return false;
+	icnss_rail_status();
+	const uint8_t feature[] = { 0x10, 8, 0, 1, 0, 0, 0, 0, 0, 0, 0 };
+	(void)icnss_call(port, 0x3b, feature, sizeof(feature));
+	struct hakios_qrtr_port *board_port = qrtr_open(wlfw_receive, NULL, NULL);
+	if (!board_port) return false;
+	const uint8_t board_client[] = { 0x10, 1, 0, 1, 0x11, 1, 0, 1, 0x12, 1, 0, 1, 0x13, 1, 0, 1,
+	    0x15, 4, 0, 0x4e, 0x4f, 0x4d, 0x44 };
+	bool supplied = icnss_call(board_port, 0x20, board_client, sizeof(board_client)) &&
+	    icnss_call(board_port, 0x24, NULL, 0) && icnss_default_board() && icnss_board_data(board_port);
+	if (!supplied) { qrtr_close(board_port); return false; }
+	(void)icnss_mac_address(board_port);
+	uint64_t until = now_us() + 30000000;
+	while (!wlfw_ready && !wlfw_next_port && !raphael_wlan_crashed && now_us() < until) {
+		if (wlfw_rejuvenating) {
+			wlfw_rejuvenating = false;
+			if (!icnss_call(port, 0x3a, NULL, 0)) { qrtr_close(board_port); return false; }
+		}
+		sleep_us(1000);
+	}
+	qrtr_close(board_port);
+	if (!wlfw_ready && wlfw_next_port && !raphael_wlan_crashed) {
+		/* shortcut: one endpoint handoff per diagnostic run; continuous Wi-Fi needs driver lifecycle recovery. */
+		if (handoffs++ == 0) {
+			printf("wifi: ICNSS reconnect %u:%u -> %u:%u\n", wlfw_node, wlfw_port, wlfw_next_node, wlfw_next_port);
+			wlfw_node = wlfw_next_node; wlfw_port = wlfw_next_port; wlfw_msa_ready = false;
+			goto retry;
+		}
+		printf("wifi: ICNSS endpoint changed again; stopping diagnostic\n");
+		return false;
+	}
+	printf("wifi: ICNSS WLAN firmware %s; MSA indication %s\n", raphael_wlan_crashed ? "EARLY CRASH" :
+	    wlfw_ready ? "READY" : "NOT READY after 30 s", wlfw_msa_ready ? "received" : "missing");
+	if (raphael_wlan_crashed) radio_space_faults();
+	if (!wlfw_ready) {
+		struct smp2p state;
+		if (dsp_words(&state)) show_words("ICNSS timeout", &state);
+		show_crash_reason();
+	}
+	return wlfw_ready && !raphael_wlan_crashed;
 }
 
 /* ---- step 15: the exchange with the Wi-Fi firmware's service ---------------------------------------- */
@@ -3261,8 +4444,6 @@ hakios_wifi_file(const char *name, uint64_t *size)
 {
 	return image_file(name, size);
 }
-
-static void radio_space_faults(void);
 
 /*
  * With wifi_lx: ath11k itself in place of the stand-in. Its qmi.c has the exchange, core.c asks
@@ -3343,7 +4524,8 @@ step_driver(uint32_t how)
 {
 	int error;
 
-	announce(how >= 2 ? "hand the radio to ath11k itself: its exchange with the firmware up to mission mode, then THE RADIO'S "
+	if (hakios_is_raphael()) announce("start the SM8150 SNOC host driver after ICNSS firmware READY");
+	else announce(how >= 2 ? "hand the radio to ath11k itself: its exchange with the firmware up to mission mode, then THE RADIO'S "
 	    "REGISTERS ARE WRITTEN, by ce.c and hal.c: the copy engines' rings (every write is said as it is made)" :
 	    "hand the firmware to ath11k itself: its own exchange up to mission mode; the radio's registers are neither read "
 	    "nor written (wifi_lx=1), and nothing is written but datagrams");
@@ -3477,6 +4659,10 @@ step_qrtr(void)
 		return false;
 	}
 	PE_parse_boot_argn("wifi_listen", &seconds, sizeof(seconds));
+	if (hakios_is_raphael() && hakios_wifi_option("wifi_diag")) mpss_microdump("before WLAN");
+	if (hakios_is_raphael() && hakios_wifi_option("wifi_ask") && hakios_wifi_option("wifi_diag") && !mpss_diag_start()) return false;
+	if (hakios_is_raphael() && hakios_wifi_option("wifi_ask") && (!mpss_storage_start() || !tftp_start())) return false;
+	if (hakios_is_raphael() && hakios_wifi_option("wifi_ask")) { pd_mapper_start(); if (hakios_wifi_option("wifi_pdr")) wlan_pdr_start(); }
 	announce("listen for QRTR on the channel: the DSP's hello is answered with ours, its services are written down; and a "
 	    "port of ours looks the Wi-Fi firmware's service up, as the radio's driver will");
 	port = qrtr_open(wlfw_receive, wlfw_service, NULL);
@@ -3493,6 +4679,16 @@ step_qrtr(void)
 	printf("wifi: %u: QRTR: the DSP is node %u; hellos from it %u; datagrams received %u, sent %u; services it has told of: "
 	    "%u; the Wi-Fi firmware's service: %s\n", step, qrtr_peer, qrtr_hellos, qrtr_in, qrtr_out, services, wlfw_port != 0 ?
 	    "THERE" : "NOT THERE");
+	if (hakios_is_raphael() && wlfw_port && hakios_wifi_option("wifi_ask")) {
+		bool ready = icnss_bootstrap(port);
+		if (raphael_wlan_crashed && hakios_wifi_option("wifi_diag")) {
+			sleep_ms(3000);
+			mpss_microdump("after WLAN crash");
+		}
+		qrtr_close(port);
+		wlfw_connected = false;
+		return ready;
+	}
 	if (wlfw_port != 0 && PE_parse_boot_argn("wifi_ask", &ask, sizeof(ask)) && ask) {
 		/*
 		 * A question the service answers without having been told anything first? A QMI request is
@@ -3542,7 +4738,7 @@ static struct block apps_smmu = { "apps smmu", 0x15000000, 0x2000 };
 #define SMMU_IDR1               0x024           /* bit 31: 64K pages, [30:28] log2(pages)-1, [7:0] translation contexts */
 #define SMMU_SMR(n)             (0x800 + 4 * (n))       /* bit 31 valid, [30:16] mask, [14:0] stream */
 #define SMMU_S2CR(n)            (0xc00 + 4 * (n))       /* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
-#define RADIO_STREAM            0x1c00
+#define RADIO_STREAM            (hakios_is_raphael() ? 0x640u : 0x1c00u)
 #define RADIO_STREAM_MASK       0x0001
 
 static void
@@ -3558,6 +4754,9 @@ smmu_look(void)
 	scr0 = get(&apps_smmu, "scr0", SMMU_SCR0);
 	idr0 = get(&apps_smmu, "idr0", SMMU_IDR0);
 	idr1 = get(&apps_smmu, "idr1", SMMU_IDR1);
+	get(&apps_smmu, "global fault status", 0x48);
+	get(&apps_smmu, "global fault syndrome 0", 0x50);
+	get(&apps_smmu, "global fault syndrome 1", 0x54);
 	matches = idr0 & 0xff;
 	printf("wifi: 0: the SMMU is %s; %u stream match registers, %u contexts; a stream nobody matches %s\n", scr0 & 1 ? "OFF" : "on",
 	    matches, idr1 & 0xff, scr0 & 1u << 10 ? "faults" : "passes untranslated");
@@ -3746,6 +4945,9 @@ radio_space_find(void)
 			printf("wifi: %u: match register %u is in use: stream %#x mask %#x, s2cr %#x\n", step, n, smr & 0x7fff,
 			    smr >> 16 & 0x7fff, s2cr);
 			used[s2cr & 0xff] = true;
+			if (((smr & 0x7fff) ^ RADIO_STREAM) & ~(smr >> 16 & 0x7fff | RADIO_STREAM_MASK)) continue;
+			printf("wifi: %u: radio stream already belongs to an existing SMMU match; left unchanged\n", step);
+			return false;
 		} else if (radio_space.match == ~0u) {
 			radio_space.match = n;
 			radio_space.old_smr = smr;
@@ -3876,6 +5078,20 @@ radio_space_off(void)
 	radio_space.on = false;
 }
 
+static bool
+icnss_smmu_prepare(void)
+{
+	bool good;
+	lck_mtx_lock(&hakios_smmu_lock);
+	if (radio_space.on) good = true;
+	else {
+		radio_space.wanted = 2;
+		good = radio_space_find() && radio_enter(0x8bc00000, 0x8bc00000, 0x180000, RADIO_PTE) && radio_space_on();
+	}
+	lck_mtx_unlock(&hakios_smmu_lock);
+	return good;
+}
+
 /*
  * For the driver (hakios.lx.c): memory of ours that the radio is to see, at the address
  * returned. Without wifi_smmu=2 it has an address and the radio is shown nothing.
@@ -3986,6 +5202,10 @@ hakios_wifi_dsp_is_up(void)
 const uint8_t *
 hakios_wifi_driver_file(const char *name, uint64_t *size)
 {
+	if (hakios_is_raphael()) {
+		if (!strcmp(name, "ath10k/WCN3990/hw1.0/firmware-5.bin")) return image_file("firmware-5.bin", size);
+		return NULL;
+	}
 	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
 	const char *last = strrchr(name, '/');
 
@@ -4008,6 +5228,7 @@ hakios_wifi_driver_file(const char *name, uint64_t *size)
 bool
 hakios_wifi_radio_address(uint8_t *address)
 {
+	if (hakios_is_raphael() && icnss_mac_valid) { memcpy(address, icnss_mac, sizeof(icnss_mac)); return true; }
 	char text[32] = "";
 	uint8_t bytes[6];
 	unsigned count = 0, digits = 0, value = 0;
@@ -4157,6 +5378,7 @@ steps_over(uint32_t done)
 		dsp_shutdown("the steps are over");
 	}
 	if (!dsp_started) {
+		if (hakios_is_raphael()) { icnss_memory_stop(); mpss_storage_stop(); }
 		radio_space_off();              /* (if the DSP could not be shut down in order: all the same) */
 	}
 	lck_mtx_unlock(&dsp_lock);
@@ -4231,6 +5453,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	for (unsigned i = 0; i < sizeof(needed) && failed == 0; i++) {
 		step = needed[i];
+		if (hakios_is_raphael() && step < 6) continue;
 		if (step == 15) {
 			tell("wifi: the radio's DSP is up and linked, %llu ms in; now the driver\n", (now_us() - began) / 1000);
 		}
@@ -4273,6 +5496,55 @@ hakios_wifi_init(void)
 	}
 	if (last_step == 0 && on != 1) {
 		printf("wifi: wifi=%u is not understood: wifi=1 turns the radio on, wifi_step=N goes the first N steps of that\n", on);
+		return;
+	}
+	if (hakios_is_raphael()) {
+		/* SM8150's ICNSS is served by MPSS/ath10k; none of the WPSS/ath11k writes below apply. */
+		printf("wifi: raphael needs WCN3990 SNOC/ath10k and MPSS service 0x45; WCN6750/WPSS path disabled\n");
+		smem_phys = 0x86000000UL;
+		aoss.size = 0x1000;
+		SMEM_WPSS = 1;
+		ITEM_SMP2P_OURS = 428; ITEM_SMP2P_THEIRS = 435; ITEM_CRASH_REASON = 421;
+		PAS_WPSS = 4; WPSS_MEMORY = 0x8e000000u; WPSS_MEMORY_SIZE = 0x09600000u;
+		dsp_image_name = "modem";
+		hakios_qmi_set_transport(&qrtr_ops);
+		if (last_step == 0) {
+			if (!image_file("modem.mdt", &size) || !image_file("wlanmdsp.mbn", &size)) {
+				printf("wifi: raphael modem/WLAN firmware is missing from the RAM image\n");
+				return;
+			}
+			whole = whole_runs = true;
+			last_step = 15;
+			quiet = !(PE_parse_boot_argn("wifi_loud", &back, sizeof(back)) && back);
+			pause_ms = watch_seconds = 0;
+			new_from = STEPS + 1;
+			hakios_lx_net_early();
+			if (kernel_thread_start(whole_thread, NULL, &thread) != KERN_SUCCESS) {
+				whole_runs = false;
+				tell("wifi: no thread: the radio is not brought up\n");
+				return;
+			}
+			thread_deallocate(thread);
+			tell("wifi: SM8150 MPSS/ath10k is being brought up beside the system's start (wifi=1)\n");
+		} else if (last_step == 1) {
+			show_partition("APPS and MPSS (0 and 1), read only", 0, 1);
+			show_partition("global, read only", SMEM_GLOBAL, SMEM_GLOBAL);
+		} else if (last_step >= 6 && last_step <= 15) {
+			PE_parse_boot_argn("wifi_new", &new_from, sizeof(new_from));
+			PE_parse_boot_argn("wifi_pause", &pause_ms, sizeof(pause_ms));
+			PE_parse_boot_argn("wifi_watch", &watch_seconds, sizeof(watch_seconds));
+			if (hakios_wifi_option("wifi_smmu") == 1) smmu_look();
+			hakios_qmi_set_transport(&qrtr_ops);
+			for (step = 6; step <= last_step; step++) {
+				if (!steps[step - 1]()) break;
+				printf("wifi: MPSS step %u: done\n", step);
+				done = step;
+			}
+			step = done;
+			if (hakios_wifi_option("wifi_smmu") == 1) smmu_look();
+			steps_over(done);
+			if (PE_parse_boot_argn("wifi_return", &back, sizeof(back)) && back) loader_return();
+		}
 		return;
 	}
 	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {

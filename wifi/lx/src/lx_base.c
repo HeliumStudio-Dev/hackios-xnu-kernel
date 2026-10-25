@@ -698,6 +698,22 @@ linux_cancel_delayed_work_sync(struct delayed_work *dwork)
 	return (linux_cancel_work_sync(&dwork->work) || waited);
 }
 
+bool
+linux_flush_work(struct work_struct *work)
+{
+	if (work->work_queue == NULL) return false;
+	struct lx_workqueue *queue = __containerof(work->work_queue, struct lx_workqueue, shown);
+	bool waited = false;
+	lx_os_lock();
+	while (queue->thread != lx_os_thread_self() &&
+	    (queue->running == work || atomic_read(&work->state) != WORK_IDLE)) {
+		lx_os_sleep(&queue->running, SLICE_NS);
+		waited = true;
+	}
+	lx_os_unlock();
+	return waited;
+}
+
 void
 linux_work_fn(void *context, int pending)
 {
